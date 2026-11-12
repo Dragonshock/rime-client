@@ -1,0 +1,10 @@
+.DS_Store
+.build/
+.swiftpm/
+DerivedData/
+*.xcuserstate
+__pycache__/
+*.pyc
+.venv/
+code/voice-worker/.venv/
+dev-docs/refs/code/**/.git

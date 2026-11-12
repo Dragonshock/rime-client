@@ -1,0 +1,22 @@
+头文件搜索路径：code/Client/Headers 下的符号链接指向 dev-docs/refs/code/librime（rime_api_stdbool.h、rime_api.h、rime/key_table.h、X11/keysym.h、X11/keysymdef.h）。Client 目标的 headerSearchPath 是 ../Headers。Squirrel 编译时 -I 同一目录。
+
+语法检查（仓库根目录）：
+xcrun clang -fsyntax-only -x objective-c -isysroot "$(xcrun --show-sdk-path)" -H -I code/Client/Headers code/Client/sources/Squirrel-Bridging-Header.h
+
+结果：exit 0。已打开：
+. code/Client/Headers/rime_api_stdbool.h
+. code/Client/Headers/rime/key_table.h
+.. code/Client/Headers/X11/keysym.h
+... code/Client/Headers/X11/keysymdef.h
+.. code/Client/Headers/rime_api.h
+
+本机已有 librime 动态库：/nix/store/i3r73fca2jfd0m75xr1zlfmdp3zblhya-librime-1.17.0/lib/librime.1.17.0.dylib。pkg-config --libs rime 为 -L/nix/store/i3r73fca2jfd0m75xr1zlfmdp3zblhya-librime-1.17.0/lib -lrime。该 -L/-lrime 已写入 Squirrel 的 linkerSettings。未在 refs 里 make install。
+
+编译：
+cd code/Client && swift build --product Squirrel
+
+结果：Build complete。产物 code/Client/.build/out/Products/Debug/Squirrel 链接 /nix/store/i3r73fca2jfd0m75xr1zlfmdp3zblhya-librime-1.17.0/lib/librime.1.dylib，并引用 _rime_get_api_stdbool。
+
+swift build 与 swift test：code/Client、code/VoiceInterface 均通过。
+
+输入法包：code/Client/dist/Squirrel.app
