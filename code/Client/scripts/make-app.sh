@@ -15,6 +15,43 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Frameworks" "$APP/Contents/Resourc
 cp "$BIN" "$APP/Contents/MacOS/Squirrel"
 cp "$ROOT/dev-docs/refs/code/squirrel/resources/rime.pdf" "$APP/Contents/Resources/rime.pdf"
 cp "$ROOT/code/voice-worker/worker.py" "$APP/Contents/Resources/worker.py"
+
+# mlx.metallib 来自 mlx-sys 的构建输出。权重来自本机 Hugging Face 快照，必须解开符号链接。
+# 构建目录里可能有多份 mlx-sys 产物，只取最新的一份。
+METALLIB="$(find "$ROOT/code/voice-engine/target" -path '*/mlx-sys-*/out/build/lib/mlx.metallib' -type f -print0 | xargs -0 ls -t 2>/dev/null | head -1)"
+test -n "$METALLIB"
+test -f "$METALLIB"
+test ! -L "$METALLIB"
+cp -L "$METALLIB" "$APP/Contents/Resources/mlx.metallib"
+test -f "$APP/Contents/Resources/mlx.metallib"
+test ! -L "$APP/Contents/Resources/mlx.metallib"
+
+HF_ROOT="$HOME/.cache/huggingface/hub/models--moona3k--mlx-qwen3-asr-0.6b-4bit"
+REV="$(tr -d '[:space:]' < "$HF_ROOT/refs/main")"
+SNAP="$HF_ROOT/snapshots/$REV"
+test -f "$SNAP/weights.safetensors"
+test -f "$SNAP/config.json"
+test -f "$SNAP/tokenizer_config.json"
+test -f "$SNAP/vocab.json"
+test -f "$SNAP/merges.txt"
+MODEL="$APP/Contents/Resources/Models/Qwen3-ASR-0.6B-4bit"
+mkdir -p "$MODEL"
+cp -RL "$SNAP/." "$MODEL/"
+test -f "$MODEL/weights.safetensors"
+test -f "$MODEL/config.json"
+test -f "$MODEL/tokenizer_config.json"
+test -f "$MODEL/vocab.json"
+test -f "$MODEL/merges.txt"
+test ! -L "$MODEL/weights.safetensors"
+test ! -L "$MODEL/config.json"
+test ! -L "$MODEL/tokenizer_config.json"
+test ! -L "$MODEL/vocab.json"
+test ! -L "$MODEL/merges.txt"
+if find "$MODEL" -type l | grep -q .; then
+  echo "model directory still contains a symlink" >&2
+  exit 1
+fi
+
 mkdir -p "$APP/Contents/Resources/zh-Hans.lproj" "$APP/Contents/Resources/en.lproj"
 cat > "$APP/Contents/Resources/zh-Hans.lproj/InfoPlist.strings" << 'EOF'
 "im.dragonshock.inputmethod.RimeClient" = "RimeClient";

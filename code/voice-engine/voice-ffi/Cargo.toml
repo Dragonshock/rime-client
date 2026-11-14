@@ -1,0 +1,20 @@
+[package]
+name = "voice-ffi"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "语音引擎的 C ABI。引擎线程把 PCM 交给 voice-asr"
+
+[lib]
+name = "voice_ffi"
+crate-type = ["staticlib", "rlib"]
+
+[features]
+default = []
+# 打开后引擎线程使用 voice-mlx。关闭时仍用 voice-tensor 的假后端。
+metal = ["dep:voice-mlx", "voice-mlx/metal"]
+
+[dependencies]
+voice-asr = { path = "../voice-asr" }
+voice-tensor = { path = "../voice-tensor" }
+voice-mlx = { path = "../voice-mlx", optional = true }

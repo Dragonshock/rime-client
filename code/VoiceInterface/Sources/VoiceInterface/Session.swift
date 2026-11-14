@@ -111,6 +111,22 @@ public struct VoiceMachine {
         return effects
     }
 
+    /// 引擎拒绝了这一次。会话就此关闭，下一次按下才能开新会话；
+    /// 已经写出去的预编辑在仍是自己那一串时才清掉。文本不提交。
+    public mutating func abandon(sessionID: UInt64, host: HostSnapshot) -> [VoiceEffect] {
+        guard var current = session, current.life == .open, current.id == sessionID else {
+            return []
+        }
+        var effects: [VoiceEffect] = []
+        if shouldClearVoiceCache(current, host: host) {
+            current.lastShown = nil
+            effects.append(.show(sessionID: sessionID, text: "", caretUTF16: 0))
+        }
+        current.life = .closed
+        session = current
+        return effects
+    }
+
     private func shouldClearVoiceCache(_ current: VoiceSession, host: HostSnapshot) -> Bool {
         guard current.deliveryAllowed, !host.clientMissing, host.bundleIdentifier == current.bundleIdentifier else {
             return false

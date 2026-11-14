@@ -1,0 +1,245 @@
+# voice-ffi --features metal 的编译记录
+
+Metal 已链上。`cargo test --workspace` 不打开 `metal`，不编译 MLX，测试通过。
+
+## 不打开 metal
+
+```
+cd code/voice-engine
+cargo test --workspace --offline
+```
+
+exit 0。`voice-asr` 9、`voice-ffi` 11、`voice-mel` 3、`voice-tokenizer` 4+5、`voice-parity` 2+4（另有 4 条 `#[ignore]`）、`voice-tensor` 的 `shapes` 6 通过：合计 44 通过、4 忽略、0 失败。`voice-mlx` 在未打开 `metal` 时没有测试，也没有下载或编译 `mlx-rs`。
+
+## 打开 metal
+
+```
+cd code/voice-engine
+export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+export LIBRARY_PATH="$SDKROOT/usr/lib"
+export MLX_SYS_SYSTEM_SDK=1
+cargo build -p voice-ffi --features metal --target aarch64-apple-darwin
+```
+
+exit 0。`mlx-sys` 0.7.0、`mlx-rs` 0.34.0、`voice-mlx`、`voice-ffi` 都编完。
+
+产物：
+
+- `code/voice-engine/target/aarch64-apple-darwin/debug/libvoice_ffi.a`（267M）
+- `code/voice-engine/target/aarch64-apple-darwin/debug/build/mlx-sys-6cd75aa1123af3a9/out/build/lib/mlx.metallib`（175M）
+
+`cargo rustc -p voice-ffi --features metal --target aarch64-apple-darwin --lib --crate-type staticlib -- --print native-static-libs` 打印：
+
+```
+native-static-libs: -liconv -lc++ -lobjc -framework Foundation -framework Metal -lSystem -lc -lm
+```
+
+`libmlx.a` 等静态库的目标文件已经打进 `libvoice_ffi.a`，这一行没有再列 `-lmlx`。`mlx-rs` 的 `accelerate` 特性没有打开，但 MLX 的 CMake 在找到 Accelerate 时仍编译了引用 `cblas` 与 BNNS 的对象，链接时要加 `-framework Accelerate`。
+
+`-force_load` 这份归档会撞上 Rust `compiler_builtins` 与 `libclang_rt.osx.a` 的重复符号。Squirrel 用 `-Xlinker -u` 拉住 `_voice_engine_new`、`_voice_engine_free`、`_voice_engine_set_callback`、`_voice_session_begin`、`_voice_session_feed`、`_voice_session_finish`。
+
+## otool
+
+`swift build --product Squirrel` exit 0。产物 `code/Client/.build/out/Products/Debug/Squirrel`。
+
+`otool -L` 出现：
+
+```
+/System/Library/Frameworks/Metal.framework/Versions/A/Metal (compatibility version 1.0.0, current version 383.1.0)
+/System/Library/Frameworks/Accelerate.framework/Versions/A/Accelerate (compatibility version 1.0.0, current version 4.0.0)
+```
+
+`nm -gU` 出现 `_voice_engine_new`、`_voice_engine_free`、`_voice_engine_set_callback`、`_voice_engine_set_reply_sink`、`_voice_engine_last_error`、`_voice_session_begin`、`_voice_session_feed`、`_voice_session_finish`（共 8 条）。
+
+ld 警告：MLX 目标文件按 macOS 27.2.1 编译，Squirrel 的部署目标是 14.0。链接仍然完成。
+
+## 定稿走真实路径（2026-11-14，见 055）
+
+`voice-mlx::transcribe_finish` 那张 64 均值 8x8 图已经删掉。现在定稿走
+`voice-mlx::transcribe(model_dir, pcm)`：
+
+1. `voice-mel` 出 `(128, frames)` 梅尔；
+2. `AudioTower::open` + `encode_mel` 出 `(audio_tokens, 1024)`；
+3. `voice-tokenizer` 按参考模板拼提示（`language Chinese<asr_text>`），音频占位个数取编码器实际行数；
+4. `TextDecoder::prefill` 之后逐步喂 1 个 token，键值写进 28 层的 KV 缓存，全词表 argmax；
+5. 遇到 `151643`（`<|endoftext|>`）或 `151645`（`<|im_end|>`）停下，最多 256 个新 token；
+6. 还原文本时去掉特殊 token 的字面量。
+
+`WeightDecoder` 定稿时把累积样本交给这条路径，`StepOutput` 里的 `text` 与 `tokens`
+都来自它。不打开 `metal` 时仍是 `UnlinkedDecoder`，空串、`is_final` 为真。
+
+- 空音频：`Session::finish` 在样本为 0 时直接回空串定稿，`finish` 返回 0。
+- 打不开权重或某一步失败：文本为空串，原因 `定稿计算失败：<错误>` 进 `failure_reason`，
+  `voice_session_finish` 返回非 0。
+- 部分文本（说话中）目前不发：`WeightDecoder` 只在 `is_final` 时算，非定稿步回空串。
+
+## 一行 JSON 与失败原因
+
+回复口有两个：C 函数指针 `voice_text_fn`（旧）与一行 JSON 的 `voice_reply_fn`（`voice_engine_set_reply_sink`）。JSON 行由 `voice-ffi/src/json_line.rs` 拼出，键就是 Swift 侧 `RecognitionReplyParser` 读的六个：`session`、`text`、`decoded`、`kind`、`ok`、`message`。两处回复因此同形，解析器只有一处。
+
+- JSON 口装上之后文本事件只走它，文本指针不再被调用（两个口不会重复发）。
+- `decoded` 恒为真：这条回复带着一段解出来的文本。部分结果只在文本变化时才发，定稿不看这一位。
+- 定稿失败时先发一条空串的 `kind:"final"`（会话确实没有文本），再发一行 `ok:false`、`message` 是原因。
+- 原因同时留在 `last_error` 里，`voice_engine_last_error(engine, buf, n)` 同步读出；调用线程据此把原因写进日志，不必等回调。
+
+## 本次实测
+
+```
+cd code/voice-engine
+cargo test --workspace --offline
+```
+
+exit 0。44 通过、4 忽略（`voice-parity` 里四个指向 MLX 实对照的入口）、0 失败。
+
+```
+export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+export LIBRARY_PATH="$SDKROOT/usr/lib"
+export MLX_SYS_SYSTEM_SDK=1
+cargo build -p voice-ffi --features metal --target aarch64-apple-darwin
+```
+
+exit 0（增量 1.8 秒，无改动时 0.1 秒）。产物
+`target/aarch64-apple-darwin/debug/libvoice_ffi.a`。
+
+端到端那条（链接参数见下面「音频塔」一节，三条缺一不可）：
+
+```
+cargo test -p voice-mlx --features metal --target aarch64-apple-darwin --offline \
+  --test end_to_end_parity -- --nocapture --test-threads=1
+```
+
+4 条全过：提示 44 个 id 与参考逐位相同、贪心 `[106287, 1773, 151645]` 与
+`greedy_tokens_3` 逐位相同、文本 `"嗯。"`、缓存单步与重算扩展提示的 argmax 同为 1773。
+一次 `transcribe` 对 2 秒探针的墙钟 11.7 秒（未预热，含两次权重装载与 44 token 预填充）。
+
+用同一份归档链了一个临时程序（`/tmp/voice-abi/e2e`，不在 `code/` 内），参数是
+HF 快照目录与已安装包的 `mlx.metallib`：
+
+- 喂 `probe_pcm.bin` 的 32000 个采样再 finish：
+  `{"decoded":true,"kind":"final","ok":true,"session":7,"text":"嗯。"}`，`finish` 返回 0，
+  `last_error` 返回 0，墙钟 13.6 秒（含进程启动与权重装载）。
+- 空会话（不 feed 直接 finish）：
+  `{"decoded":true,"kind":"final","ok":true,"session":8,"text":""}`，`finish` 返回 0。
+
+这次不是麦克风输入。从麦克风到文字的时延：未知。
+
+## 新增：梅尔前端与分词器（2026-11-14）
+
+- `voice-mel`：128 维对数梅尔，参数与参考一致（400/160/128/0..8000，周期 Hann，功率谱，丢最后一帧，相对最大值截 8 再 (x+4)/4）。滤波器组与窗取自参考资产。与参考逐元素最大差 < 1e-3。
+- `voice-tokenizer`：字节级 BPE，特殊 token id 从 `tokenizer_config.json` 读。与参考的编码结果逐条一致。
+- 仍缺：编码器与解码器的数值前向。`finish` 目前明确回失败原因，不提交假文本。
+
+    cargo test -p voice-mel --offline
+    cargo test -p voice-tokenizer --offline
+    VOICE_MODEL_DIR=<模型目录> cargo test -p voice-tokenizer --offline
+
+## 新增：音频塔的真实数值与三个闸（2026-11-14）
+
+`voice-mlx` 现在有两条新东西：
+
+- `backend/weights.rs`：读 `weights.safetensors` 的表头与裸数据，稠密张量（卷积、LayerNorm、偏置）与分组权重（文本 4 位、音频 8 位，组大小 64，键名带 `.scales`/`.biases`）分开走。
+- `backend/audio_tower.rs`：`AudioTower::open` 读出 `audio_tower.*` 的 18 层，`encode_mel` 按 042 第 4 节跑完卷积茎、位置表、窗内注意力与末尾投影。
+
+跑编码器的对照测试要给三条链接参数。缺一条都不止是警告：测试二进制要真链接 Metal，MLX 的静态库引用 `Accelerate` 的 BNNS 与 `cblas`，还引用了当前 SDK 只在 arm64e 段导出的几个 Metal/Foundation 弱符号与两个 `_Float16` 内建。
+
+```
+export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+export LIBRARY_PATH="$SDKROOT/usr/lib"
+export MLX_SYS_SYSTEM_SDK=1
+export RUSTFLAGS="-C link-arg=-framework -C link-arg=Accelerate \
+  -C link-arg=-Wl,-U,_MTLTensorDomain -C link-arg=-Wl,-U,_MTLLogStateErrorDomain \
+  -C link-arg=-Wl,-U,_NSDeviceCertificationiPhonePerformanceGaming \
+  -C link-arg=-Wl,-U,_NSProcessInfoPerformanceProfileDidChangeNotification \
+  -C link-arg=-Wl,-U,_NSProcessPerformanceProfileDefault \
+  -C link-arg=-Wl,-U,_NSProcessPerformanceProfileSustained \
+  -C link-arg=-Wl,-U,___fmaxf16 -C link-arg=-Wl,-U,___fminf16"
+cargo test -p voice-mlx --features metal --target aarch64-apple-darwin --offline
+```
+
+`-Wl,-U,<符号>` 是「允许这个符号留到运行时再解析」。这几个符号是 MLX 的 `device.cpp` 里 `__cxx_global_var_init` 与 `reduce.cpp` 的 f16 内建引用；参考那次（13 Nov）编出来的测试二进制里它们本来就是弱引用/动态解析，这次的写法只是把同一件事写明确。
+
+不打开 `metal` 时 `cargo test --workspace --offline` 照旧，不编 MLX，也不跑这三项对照。
+
+## 常驻权重（2026-11-14，见 notes/057）
+
+`voice_engine_new` 现在把读盘与反量化一次做完，之后的 `finish` 只借用同一份实例。
+
+- `voice-mlx`：`backend/transcribe.rs` 新增 `Engine`（梅尔前端 + `AudioTower` + `TextDecoder` + `Tokenizer`）与 `transcribe_with_opened`（`Opened` 里全是借用）。`transcribe` / `transcribe_with` 签名不变，内部现开现用，只给对照与单次实验。
+- `voice-mlx`：`TextDecoder::open` 一次装好 28 层、末尾 RMSNorm 与词嵌入表（`weights.rs` 的 `affine_table` 按行分块反量化，`MlxBackend::take_rows` 从常驻表取行）。文件句柄在 `open` 里就关掉，方法之外没有第二处能读到那张文件。
+- `voice-ffi`：`backend::boot` 在 `MlxBackend::prepare` 之后调 `decoder::boot_resident`，把 `voice_mlx::Engine` 放进引擎线程的 `thread_local!` 槽；`WeightDecoder` 只借用它（张量不是 `Send`，所以实例留在引擎线程上，与 GPU stream 同一套做法）。`WeightDecoder::new()` 不再带模型目录。
+
+同一探针（`code/voice-oracle/assets/probe_pcm.bin`）在同一进程里连跑两次，归档为本次编出的
+`target/aarch64-apple-darwin/debug/libvoice_ffi.a`：
+
+```
+engine_new 4.908 s（含常驻权重）
+cold finish 0.807 s status=0   # 启动后第一次
+warm finish 0.466 s status=0   # 同进程第二次
+warm finish 0.463 s status=0   # 同进程第三次
+```
+
+文本仍是 `嗯。`，token 仍是 `[106287, 1773, 151645]`；把 `weights.safetensors` 从模型目录里
+挪走再跑，两次定稿照常出同样的文本，说明第二次及以后不读盘。峰值内存从 2.07 GB 涨到 2.92 GB
+（28 层 f16 约 820 MB 与词嵌入表约 311 MB 常驻）。
+
+四条端到端对照测试各持一份常驻实例，并行跑满四线程会超过本机 16 GB，用 `--test-threads=2`
+或 `--test-threads=1`。
+
+## 量化矩阵乘与 `lm_head` 逐块 argmax（2026-11-14，见 notes/058）
+
+文本塔的七个投影与词嵌入表改成「打包值 + 缩放 + 偏置」三块常驻，前向直接走
+`ops::quantized_matmul`（affine、组 64、4 位、`transpose: true`），`f16` 的整层稠密表
+不再产生。`lm_head` 就是词嵌入表本身，`argmax` 按块算（`LM_HEAD_BLOCK = 32768` 行，
+词表分 5 块），整张词表从不一次取齐。
+
+- `voice-mlx`：`weights.rs` 新增 `grouped_tensor` / `affine_packed` / `affine_table_packed`，
+  删掉 057 的 `affine_table`（按行分块反量化成整张 f16 常驻表）。
+- `voice-mlx`：`backend.rs` 的 `linear` 见分组权重且激活是 f16 时走量化矩阵乘，否则退回
+  「先还原再乘」；`take_rows` 对分组权重按同样下标取三块；新增 `materialize`。
+- `voice-mlx`：`text_decoder.rs` 新增 `QuantPolicy`（注意力、MLP 两组开关，默认都走，
+  `dequantized()` 复现 057 的算术）与 `TextDecoder::open_with`。
+- `voice-mlx`：新增测试 `decoder_parity::quantized_paths_are_compared_group_by_group`（逐组
+  归因）与 `tests/phase_timing.rs`（分段计时，`#[ignore]`，顺带断言 token 序列）。
+- `audio_tower.rs` 未改：8 位线性层也换成打包之后，`encoder_proj_out` 那一档会让
+  `wrong_encoder_options_make_the_difference_bigger` 的「换错口径应更差」不成立，
+  按 notes/058 第 2.2 节整段回退。
+
+同一探针、同一份归档（`dev` 档案，页缓存暖）：
+
+```
+engine_new 4.646–4.723 s（含常驻打包三块）
+cold finish 0.424–0.486 s status=0
+warm finish 0.405–0.424 s status=0
+```
+
+文本仍是 `嗯。`，token 仍是 `[106287, 1773, 151645]`。解码器主闸首 64 维最大差
+3.125e-2 → 7.8125e-2（容差 8.203125e-2，余量 1.05 倍）；编码器三条与端到端四条不变。
+峰值 footprint 2.92 GB → 1.63 GB，maximum resident set size 323 MB → 634 MB。
+
+三条闸都要 `--test-threads=1`（各持一份常驻实例）。
+
+## 常驻实例装进包（2026-11-14，见 notes/059）
+
+`voice_mlx::Engine` 与 `voice-ffi` 的线程局部常驻槽在 057/058 已经写好，但 14:05 打的那份
+包早于这两次改动：`voice_engine_new` 只起线程就返回（0.035 s），513 MB 的读盘与反量化整个
+落在 `finish` 里，还因为 `AudioTower::open` 与 `TextDecoder::open` 各读一遍而读了两次 ——
+2 秒探针那次量到 12.534 s。这一步只重编、重打包、重装，没有改算术。
+
+```
+cd code/voice-engine
+export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+export LIBRARY_PATH="$SDKROOT/usr/lib"
+export MLX_SYS_SYSTEM_SDK=1
+cargo build -p voice-ffi --features metal --target aarch64-apple-darwin
+cd ../Client && rm -f .build/out/Products/Debug/Squirrel && swift build --product Squirrel
+bash scripts/make-app.sh
+```
+
+新产物 `Debug/Squirrel` 40499476 字节，`nm` 里 `backend10transcribe` 43 次。同一个
+`bench`（`/tmp/voice-abi/bench-r`）三次：`load 4.735–4.937 s`、`finish 0.502 / 0.443 / 0.440 s`，
+中位 0.443 s；`bench2` 同进程 cold 0.608、warm 0.424、warm 0.410。文本仍是 `嗯。`，token
+仍是 `[106287, 1773, 151645]`（`end_to_end_parity` 断言）。装包后
+`codesign --verify --deep --strict` exit 0。
+
+第一次按键仍付 4.7–4.9 s：`SquirrelInputController.ensureVoiceGate()` 懒建引擎，那段在
+`code/Client`，本次没动。所有秒数都是 `dev` 档案。

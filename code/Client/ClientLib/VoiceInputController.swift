@@ -13,6 +13,7 @@ public enum VoiceClientLocation {
 }
 
 /// 不依赖 librime 的控制器接入。handle 在 processKey 之前调用 consume。
+/// 未注入传输时，识别入口是 `VoiceEngine`，不启动解释器。
 public final class VoiceInputController: VoiceFieldHost {
     /// 右 Option。换成别的修饰键码即换绑定。
     public static let defaultConfiguredKey: UInt16 = 0x3D
@@ -34,8 +35,8 @@ public final class VoiceInputController: VoiceFieldHost {
         bundleIdentifier: String? = nil,
         transport: RecognitionTransport? = nil,
         capture: PCMSource? = nil,
-        workerURL: URL = VoiceClientLocation.workerScript,
-        pythonURL: URL = URL(fileURLWithPath: "/usr/bin/python3"),
+        modelDirectory: String = VoiceEngine.bundledModelDirectory(),
+        metallibPath: String = VoiceEngine.bundledMetallib(),
         processKey: @escaping (VoiceKeyEvent) -> Bool = { _ in false },
         showPreedit: @escaping (String, NSRange, Int) -> Void = { _, _, _ in },
         commitString: @escaping (String) -> Void = { _ in }
@@ -49,10 +50,12 @@ public final class VoiceInputController: VoiceFieldHost {
         self.commitString = commitString
 
         let bridge = ReplyBridge()
-        let resolvedTransport = transport ?? LazyWorkerTransport(
-            pythonURL: pythonURL,
-            workerURL: workerURL,
-            bridge: bridge
+        let resolvedTransport = transport ?? VoiceEngine(
+            modelDirectory: modelDirectory,
+            metallibPath: metallibPath,
+            onReply: { reply in
+                bridge.onReply?(reply)
+            }
         )
         let resolvedCapture = capture ?? EnginePCMSource()
         self.gate = VoiceHandleGate(
@@ -98,29 +101,3 @@ private final class ReplyBridge {
     var onReply: ((RecognitionReply) -> Void)?
 }
 
-private final class LazyWorkerTransport: RecognitionTransport {
-    private let pythonURL: URL
-    private let workerURL: URL
-    private let bridge: ReplyBridge
-    private var inner: PythonRecognitionTransport?
-
-    init(pythonURL: URL, workerURL: URL, bridge: ReplyBridge) {
-        self.pythonURL = pythonURL
-        self.workerURL = workerURL
-        self.bridge = bridge
-    }
-
-    func send(_ command: RecognitionCommand) {
-        if inner == nil {
-            let bridge = bridge
-            inner = PythonRecognitionTransport(pythonURL: pythonURL, workerURL: workerURL) { reply in
-                bridge.onReply?(reply)
-            }
-        }
-        inner?.send(command)
-    }
-
-    func stop() {
-        inner?.stop()
-    }
-}

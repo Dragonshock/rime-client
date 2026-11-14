@@ -1,0 +1,22 @@
+[package]
+name = "voice-mlx"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "张量运算特质在 MLX Metal 上的实现。只有本箱 import mlx"
+
+[features]
+default = []
+metal = ["dep:mlx-rs"]
+
+[dependencies]
+voice-tensor = { path = "../voice-tensor" }
+# 梅尔前端与分词器都是纯 Rust，没有张量后端依赖；整条 PCM → 文本的路径在本箱内。
+voice-mel = { path = "../voice-mel" }
+voice-tokenizer = { path = "../voice-tokenizer" }
+mlx-rs = { version = "=0.34.0", default-features = false, features = ["metal"], optional = true }
+
+# 对照箱子只在测试里用：它读 code/voice-oracle/assets，不链接 MLX，
+# 也不被任何产品 crate 依赖。方向是 voice-mlx → voice-parity，单向。
+[dev-dependencies]
+voice-parity = { path = "../voice-parity" }

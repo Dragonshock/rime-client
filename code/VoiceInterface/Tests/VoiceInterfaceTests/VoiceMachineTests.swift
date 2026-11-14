@@ -110,4 +110,27 @@ final class VoiceMachineTests: XCTestCase {
         XCTAssertTrue(effects.isEmpty)
         XCTAssertNil(machine.session?.recognition)
     }
+
+    func testAbandonClosesTheSessionAndLetsTheNextPressOpenOne() {
+        var machine = VoiceMachine(configuredKey: ModifierKeycode.rightOption)
+        _ = press(&machine, host: host())
+        _ = machine.acceptPartial(sessionID: 1, text: "临时", host: host())
+        _ = machine.handle(
+            VoiceKeyEvent(keyCode: ModifierKeycode.rightOption, phase: .flagsChanged(pressed: false)),
+            host: host(preedit: "临时")
+        )
+        let effects = machine.abandon(sessionID: 1, host: host(preedit: "临时"))
+        XCTAssertEqual(effects, [.show(sessionID: 1, text: "", caretUTF16: 0)])
+        XCTAssertEqual(machine.session?.life, .closed)
+        let again = press(&machine, host: host())
+        XCTAssertEqual(again.1, [.startCapture(2, context: nil)])
+    }
+
+    func testAbandonKeepsForeignPreedit() {
+        var machine = VoiceMachine(configuredKey: ModifierKeycode.rightOption)
+        _ = press(&machine, host: host())
+        let effects = machine.abandon(sessionID: 1, host: host(preedit: "ni"))
+        XCTAssertTrue(effects.isEmpty)
+        XCTAssertEqual(machine.session?.life, .closed)
+    }
 }

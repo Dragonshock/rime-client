@@ -1,0 +1,10 @@
+[package]
+name = "voice-tokenizer"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Qwen3-ASR 的字节级 BPE 分词。无外部依赖"
+
+[lib]
+name = "voice_tokenizer"
+path = "src/lib.rs"

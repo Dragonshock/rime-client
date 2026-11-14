@@ -1,0 +1,10 @@
+[package]
+name = "voice-mel"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "128 维对数梅尔谱。纯 Rust，不依赖张量后端"
+
+[lib]
+name = "voice_mel"
+path = "src/lib.rs"

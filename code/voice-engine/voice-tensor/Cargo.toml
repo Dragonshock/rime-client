@@ -1,0 +1,8 @@
+[package]
+name = "voice-tensor"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "张量运算特质、形状与 Qwen3-ASR 0.6B 配置"
+
+[dependencies]

@@ -596,11 +596,16 @@ extension SquirrelInputController {
       return voiceGate
     }
     let bridge = ReplyBridge()
-    let transport = LazyWorkerTransport(
-      pythonURL: SquirrelInputController.voicePythonURL(),
-      workerURL: SquirrelInputController.voiceWorkerURL(),
-      bridge: bridge
+    let transport = VoiceEngine(
+      modelDirectory: VoiceEngine.bundledModelDirectory(),
+      metallibPath: VoiceEngine.bundledMetallib(),
+      onReply: { reply in
+        bridge.onReply?(reply)
+      }
     )
+    if let reason = transport.unavailableReason {
+      VoiceLog.write(reason)
+    }
     let gate = VoiceHandleGate(
       configuredKey: voiceConfiguredKey,
       hotwords: nil,
@@ -645,56 +650,8 @@ extension SquirrelInputController {
     }
   }
 
-  /// 脚本在包内 Resources，否则回到源码树的 code/voice-worker/worker.py。
-  private static func voiceWorkerURL() -> URL {
-    if let bundled = Bundle.main.url(forResource: "worker", withExtension: "py") {
-      return bundled
-    }
-    var url = URL(fileURLWithPath: #filePath)
-    url.deleteLastPathComponent()
-    url.deleteLastPathComponent()
-    return url.appendingPathComponent("voice-worker").appendingPathComponent("worker.py")
-  }
-
-  private static func voicePythonURL() -> URL? {
-    let venv = VoicePythonPath.interpreter(sourceFile: URL(fileURLWithPath: #filePath))
-    guard FileManager.default.isExecutableFile(atPath: venv.path) else {
-      VoiceLog.write("recognition interpreter missing \(venv.path)")
-      return nil
-    }
-    return venv
-  }
-
   private final class ReplyBridge {
     var onReply: ((RecognitionReply) -> Void)?
-  }
-
-  private final class LazyWorkerTransport: RecognitionTransport {
-    private let pythonURL: URL?
-    private let workerURL: URL
-    private let bridge: ReplyBridge
-    private var inner: PythonRecognitionTransport?
-
-    init(pythonURL: URL?, workerURL: URL, bridge: ReplyBridge) {
-      self.pythonURL = pythonURL
-      self.workerURL = workerURL
-      self.bridge = bridge
-    }
-
-    func send(_ command: RecognitionCommand) {
-      guard let pythonURL else { return }
-      if inner == nil {
-        let bridge = bridge
-        inner = PythonRecognitionTransport(pythonURL: pythonURL, workerURL: workerURL) { reply in
-          bridge.onReply?(reply)
-        }
-      }
-      inner?.send(command)
-    }
-
-    func stop() {
-      inner?.stop()
-    }
   }
 
   func commit(string: String) {

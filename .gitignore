@@ -8,3 +8,14 @@ __pycache__/
 .venv/
 code/voice-worker/.venv/
 dev-docs/refs/code/**/.git
+
+# 安装包里的模型资产不进仓库：weights.safetensors 单文件 513MB，超过 GitHub 的单文件上限。
+code/Client/dist/Squirrel.app/Contents/Resources/Models/
+code/Client/dist/Squirrel.app/Contents/Resources/mlx.metallib
+
+# Rust 构建产物。
+code/voice-engine/target/
+
+# 参考克隆各有自己的 .git，按目录整体排除，避免被当成内嵌仓库。
+dev-docs/refs/code/
+*.tmp

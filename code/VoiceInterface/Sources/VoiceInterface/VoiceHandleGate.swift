@@ -84,6 +84,13 @@ public final class VoiceHandleGate {
                 loggedRejection = message
                 VoiceLog.write("recognition rejected \(message)")
             }
+            guard let sessionID = reply.sessionID else { return }
+            lock.lock()
+            let snapshot = host.voiceSnapshot()
+            machine.noteClient(snapshot)
+            let effects = machine.abandon(sessionID: sessionID, host: snapshot)
+            lock.unlock()
+            perform(effects)
             return
         }
         lock.lock()

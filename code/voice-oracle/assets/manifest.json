@@ -1,0 +1,175 @@
+{
+  "generated_by": "code/voice-oracle/dump_reference.py",
+  "reference_package": "mlx_qwen3_asr 0.4.4（code/voice-worker/.venv，只作对照）",
+  "model_dir": "/Users/dragon/.cache/huggingface/hub/models--moona3k--mlx-qwen3-asr-0.6b-4bit/snapshots/4c59c533f95c84afb796655e814709034f826f04",
+  "model_dtype": "float16",
+  "activation_dtype": "mlx.core.float16",
+  "sample_rate": 16000,
+  "audio_input": {
+    "source": "probe",
+    "file": "probe_pcm.bin",
+    "dtype": "int16",
+    "shape": [
+      32000
+    ],
+    "bytes": 64000,
+    "formula": "sample = (i * 37) % 2001 - 1000",
+    "to_float": "pcm.astype(f32) / 32768（与 mlx_qwen3_asr.load_audio 一致）"
+  },
+  "audio_frames": {
+    "mel_frames": 200,
+    "n_audio_tokens": 26,
+    "encoder_output_lens": [
+      26
+    ]
+  },
+  "prompt": {
+    "language": "Chinese",
+    "context": "",
+    "length": 44,
+    "tokens": [
+      151644,
+      8948,
+      198,
+      151645,
+      198,
+      151644,
+      872,
+      198,
+      151669,
+      151676,
+      151676,
+      151676,
+      151676,
+      151676,
+      151676,
+      151676,
+      151676,
+      151676,
+      151676,
+      151676,
+      151676,
+      151676,
+      151676,
+      151676,
+      151676,
+      151676,
+      151676,
+      151676,
+      151676,
+      151676,
+      151676,
+      151676,
+      151676,
+      151676,
+      151676,
+      151670,
+      151645,
+      198,
+      151644,
+      77091,
+      198,
+      11528,
+      8453,
+      151704
+    ]
+  },
+  "greedy": {
+    "tokens": [
+      106287,
+      1773,
+      151645
+    ],
+    "text_from_tokens": "嗯。<|im_end|>",
+    "reference_generate_tokens": [
+      106287,
+      1773
+    ],
+    "reference_finish_reason": "eos",
+    "matches_reference_generate": true
+  },
+  "tensors": [
+    {
+      "key": "mel",
+      "file": "mel.bin",
+      "shape": [
+        128,
+        200
+      ],
+      "dtype": "float32",
+      "bytes": 102400,
+      "source": "mlx_qwen3_asr.audio.log_mel_spectrogram",
+      "note": "参考以 f32 计算后转模型 dtype 送进编码器；这里存转换前的 f32 值"
+    },
+    {
+      "key": "conv_stem_out",
+      "file": "conv_stem_out.bin",
+      "shape": [
+        16,
+        13,
+        480
+      ],
+      "dtype": "float32",
+      "bytes": 399360,
+      "source": "mlx_qwen3_asr.encoder.AudioEncoder._apply_conv_stem",
+      "note": "存的是前向里第一次 _apply_conv_stem 调用的第 0 块，布局为参考的 NHWC (频域 16, 时域 13, 480 通道)；送进 conv_out 前参考会 transpose 成 (13, 480*16)",
+      "captured_from": "首次 _apply_conv_stem 调用的输出[0]",
+      "full_call_output_shape": [
+        2,
+        16,
+        13,
+        480
+      ]
+    },
+    {
+      "key": "encoder_layer0_out",
+      "file": "encoder_layer0_out.bin",
+      "shape": [
+        1,
+        26,
+        896
+      ],
+      "dtype": "float32",
+      "bytes": 93184,
+      "source": "mlx_qwen3_asr.encoder.AudioEncoderLayer.__call__ (layers[0])",
+      "note": "第 0 层含残差的输出，送入第 1 层；本段音频只有一个注意力窗口，mask 为 None",
+      "covers_full_sequence": true,
+      "total_encoder_tokens": 26
+    },
+    {
+      "key": "encoder_proj_out",
+      "file": "encoder_proj_out.bin",
+      "shape": [
+        26,
+        1024
+      ],
+      "dtype": "float32",
+      "bytes": 106496,
+      "source": "mlx_qwen3_asr.encoder.AudioEncoder._encode_single -> ln_post/gelu(proj1)/proj2",
+      "note": "编码器末尾投影（音频特征），也是注入文本嵌入的张量"
+    },
+    {
+      "key": "prefill_logits_64",
+      "file": "prefill_logits_64.bin",
+      "shape": [
+        64
+      ],
+      "dtype": "float32",
+      "bytes": 256,
+      "source": "mlx_qwen3_asr.model.Qwen3ASRModel.prefill -> lm_head[:, -1:, :64]",
+      "note": "最后一个提示位置的 logits，只落前 64 维（全词表 151936 维）"
+    },
+    {
+      "key": "greedy_tokens_3",
+      "file": "greedy_tokens_3.bin",
+      "shape": [
+        3
+      ],
+      "dtype": "float32",
+      "bytes": 12,
+      "source": "mlx_qwen3_asr.generate._sample(argmax) + Qwen3ASRModel.prefill/step",
+      "note": "贪心解码前 3 个 token，用 f32 存整数；参考 generate 会剥掉末尾 EOS"
+    }
+  ],
+  "unavailable": []
+}

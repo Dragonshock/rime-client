@@ -1,0 +1,15 @@
+[package]
+name = "voice-parity"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "参考资产对照箱子：读取 voice-oracle 导出的 .bin 与 manifest.json，逐元素报告差值"
+
+[lib]
+name = "voice_parity"
+path = "src/lib.rs"
+
+# 对照箱子只做测量：不引入 mlx-rs，不引入序列化库，读文件与比数都用 std。
+# voice-mel 是纯 Rust 前端，没有张量后端依赖。
+[dependencies]
+voice-mel = { path = "../voice-mel" }

@@ -159,6 +159,8 @@ final class VoiceInputControllerTests: XCTestCase {
         XCTAssertTrue(source.contains("client == nil"))
         XCTAssertTrue(source.contains("EnginePCMSource()"))
         XCTAssertTrue(source.contains("0x3D"))
-        XCTAssertTrue(source.contains("voice-worker"))
+        XCTAssertTrue(source.contains("VoiceEngine("))
+        XCTAssertFalse(source.contains("voicePythonURL"))
+        XCTAssertFalse(source.contains("/usr/bin/python3"))
     }
 }

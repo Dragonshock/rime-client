@@ -1,0 +1,11 @@
+[workspace]
+resolver = "2"
+members = [
+    "voice-asr",
+    "voice-ffi",
+    "voice-mlx",
+    "voice-tensor",
+    "voice-mel",
+    "voice-parity",
+    "voice-tokenizer",
+]

@@ -20,3 +20,14 @@ cd code/Client && swift build --product Squirrel
 swift build 与 swift test：code/Client、code/VoiceInterface 均通过。
 
 输入法包：code/Client/dist/Squirrel.app
+
+一行 JSON 的回复口与失败原因各多一条符号，`-u` 一起拉住，免得 `-dead_strip` 把它们丢掉：
+
+```
+-Xlinker -u -Xlinker _voice_engine_set_reply_sink
+-Xlinker -u -Xlinker _voice_engine_last_error
+```
+
+`swift build --product Squirrel` exit 0。产物 `nm -gU` 里 8 条 `voice_*` 都是 `T`（上面 6 条加 `_voice_engine_last_error`、`_voice_engine_set_reply_sink`）。`swift test` 的 7 条 ClientTests 全通过。
+
+重新打包安装：`bash code/Client/scripts/make-app.sh` 之后 `ditto code/Client/dist/Squirrel.app "$HOME/Library/Input Methods/RimeClient.app"`（先停用户目录里那个 Squirrel 进程）。装完 `MacOS/Squirrel` 39680272 字节，`Resources/mlx.metallib` 183870464 字节，`Resources/Models/Qwen3-ASR-0.6B-4bit/weights.safetensors` 537626967 字节，模型目录符号链接数 0，`codesign --verify --deep --strict` exit 0。

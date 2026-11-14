@@ -4,6 +4,30 @@
 <dict>
 	<key>files</key>
 	<dict>
+		<key>Resources/Models/Qwen3-ASR-0.6B-4bit/config.json</key>
+		<data>
+		ZcQgaW/QTUITYqUNVYhxFV0yrYI=
+		</data>
+		<key>Resources/Models/Qwen3-ASR-0.6B-4bit/merges.txt</key>
+		<data>
+		qi32inuGlzYP07I9mAqZwnb215s=
+		</data>
+		<key>Resources/Models/Qwen3-ASR-0.6B-4bit/quantization_config.json</key>
+		<data>
+		sOwNlN7v6qAcPNjQnBB5HGVFdl8=
+		</data>
+		<key>Resources/Models/Qwen3-ASR-0.6B-4bit/tokenizer_config.json</key>
+		<data>
+		5ViCLqfCQUM/Ke61dhNicpHd1Ws=
+		</data>
+		<key>Resources/Models/Qwen3-ASR-0.6B-4bit/vocab.json</key>
+		<data>
+		kW6W0deINfoRTwK6JRW8ICxj53A=
+		</data>
+		<key>Resources/Models/Qwen3-ASR-0.6B-4bit/weights.safetensors</key>
+		<data>
+		sF+jtd+KWBIAneuFs6u52GFWGO8=
+		</data>
 		<key>Resources/en.lproj/InfoPlist.strings</key>
 		<dict>
 			<key>hash</key>
@@ -16,6 +40,10 @@
 		<key>Resources/entitlements.plist</key>
 		<data>
 		M/iglcq6w5LeoIAfkKEuoDdrlHY=
+		</data>
+		<key>Resources/mlx.metallib</key>
+		<data>
+		YN7WrzNIhHY8R+FPhJVPn+i82Ec=
 		</data>
 		<key>Resources/rime.pdf</key>
 		<data>
@@ -118,6 +146,48 @@
 			<key>requirement</key>
 			<string>cdhash H"8750fe15ed643ed65d54f19fc5c3461fa5ed3b4f"</string>
 		</dict>
+		<key>Resources/Models/Qwen3-ASR-0.6B-4bit/config.json</key>
+		<dict>
+			<key>hash2</key>
+			<data>
+			dtOuRgHOk5gwslF/SmytuGzFExbDkAr2sCCwUcIaR4w=
+			</data>
+		</dict>
+		<key>Resources/Models/Qwen3-ASR-0.6B-4bit/merges.txt</key>
+		<dict>
+			<key>hash2</key>
+			<data>
+			iDHk8aBERxNA98CoPXvXEwaluGfpX9hw900MUwipBNU=
+			</data>
+		</dict>
+		<key>Resources/Models/Qwen3-ASR-0.6B-4bit/quantization_config.json</key>
+		<dict>
+			<key>hash2</key>
+			<data>
+			BnM5uFgkOtnV4idks7gsdZp2XJ8Krf5JOdDCM/Fbnn0=
+			</data>
+		</dict>
+		<key>Resources/Models/Qwen3-ASR-0.6B-4bit/tokenizer_config.json</key>
+		<dict>
+			<key>hash2</key>
+			<data>
+			SULQBWBCZoCTCcq8n06cuJzoVdWbFGgf3A4cxi6ibEw=
+			</data>
+		</dict>
+		<key>Resources/Models/Qwen3-ASR-0.6B-4bit/vocab.json</key>
+		<dict>
+			<key>hash2</key>
+			<data>
+			yhDX6fs+0YV13R4neiV5wW0QjjLydDloSvoOELFECRA=
+			</data>
+		</dict>
+		<key>Resources/Models/Qwen3-ASR-0.6B-4bit/weights.safetensors</key>
+		<dict>
+			<key>hash2</key>
+			<data>
+			mmK7mDDcvNDPHB9AIAFh1OXwB6TNmbgxEZAokKnwh9M=
+			</data>
+		</dict>
 		<key>Resources/en.lproj/InfoPlist.strings</key>
 		<dict>
 			<key>hash2</key>
@@ -132,6 +202,13 @@
 			<key>hash2</key>
 			<data>
 			pLwrfWVfBuMedrHaBQuWThwRUoFL9LjHK1YVcm9reXY=
+			</data>
+		</dict>
+		<key>Resources/mlx.metallib</key>
+		<dict>
+			<key>hash2</key>
+			<data>
+			1SPWAi787SgX4wX9yjfDJYaPZw2WSHqvJKaGS82jxyI=
 			</data>
 		</dict>
 		<key>Resources/rime.pdf</key>
