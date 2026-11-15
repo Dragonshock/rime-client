@@ -26,3 +26,8 @@ dev-docs/refs/code/
 /dist/*.sha256
 !/dist/RimeClient-*.tar.zst
 !/dist/RimeClient-*.sha256
+
+# 封装用的中间展开目录（含 400 MB gram 与 500 MB 权重），只留 Release 资产。
+/dist/models/
+/dist/rime-config/
+/installation.yaml

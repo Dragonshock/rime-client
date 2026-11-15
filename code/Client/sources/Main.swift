@@ -11,7 +11,11 @@ import VoiceInterface
 
 @main
 struct SquirrelApp {
-  static let userDir = if let pwuid = getpwuid(getuid()) {
+  /// 用户数据目录。`RIME_USER_DIR` 只作测试与封装验证的覆盖口，生产不设。
+  static let userDir = if let override = ProcessInfo.processInfo.environment["RIME_USER_DIR"],
+                          !override.isEmpty {
+    URL(fileURLWithPath: override, isDirectory: true)
+  } else if let pwuid = getpwuid(getuid()) {
     URL(fileURLWithFileSystemRepresentation: pwuid.pointee.pw_dir, isDirectory: true, relativeTo: nil).appending(components: "Library", "Rime")
   } else {
     try! FileManager.default.url(for: .libraryDirectory, in: .userDomainMask, appropriateFor: nil, create: false).appendingPathComponent("Rime", isDirectory: true)
@@ -70,11 +74,19 @@ struct SquirrelApp {
           return true
         case "--build":
           SquirrelApplicationDelegate.showMessage(msgText: NSLocalizedString("deploy_update", comment: ""))
+          try? FileManager.default.createDirectory(
+            at: SquirrelApp.userDir, withIntermediateDirectories: true)
           var builderTraits = RimeTraits.rimeStructInit()
           builderTraits.setCString("rime.squirrel-builder", to: \.app_name)
+          // 必须显式给共享数据与用户数据两个目录：不给就走 librime 的默认路径，
+          // 部署会在别处空跑一次，界面上的「重新部署」看着成功但词库没生成。
+          builderTraits.setCString(Bundle.main.sharedSupportPath!, to: \.shared_data_dir)
+          builderTraits.setCString(SquirrelApp.userDir.path(), to: \.user_data_dir)
+          builderTraits.setCString(SquirrelApp.logDir.path(), to: \.log_dir)
           rimeAPI.setup(&builderTraits)
           rimeAPI.deployer_initialize(nil)
-          _ = rimeAPI.deploy()
+          let built = rimeAPI.deploy()
+          print("deploy finished \(built)")
           return true
         case "--sync":
           DistributedNotificationCenter.default().postNotificationName(.init("SquirrelSyncNotification"), object: nil, userInfo: nil, deliverImmediately: true)

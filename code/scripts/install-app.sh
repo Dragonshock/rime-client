@@ -9,6 +9,8 @@
 #   code/scripts/install-app.sh --dest DIR           # 装到 DIR/RimeClient.app
 #   code/scripts/install-app.sh --no-stop            # 不动正在跑的进程（调试用）
 #   code/scripts/install-app.sh --assets DIR         # 装之前把 DIR 里的权重与 metallib 补进包（封装包用这个）
+#   code/scripts/install-app.sh --rime-config DIR    # 把 DIR/Rime 的配置播种到 ~/Library/Rime（仅当它为空）
+#   code/scripts/install-app.sh --rime-config DIR --force-rime  # 覆盖已有配置（先备份）
 #
 # 环境变量：INSTALL_DEST（默认 "$HOME/Library/Input Methods"）、SOURCE_APP。
 set -euo pipefail
@@ -27,6 +29,8 @@ DEST_DIR="${INSTALL_DEST:-$HOME/Library/Input Methods}"
 NAME="RimeClient.app"
 STOP=1
 ASSETS=""
+RIME_CONFIG=""
+FORCE_RIME=0
 
 fail() {
   printf 'install-app.sh: %s\n' "$*" >&2
@@ -57,6 +61,15 @@ while [ $# -gt 0 ]; do
       [ $# -ge 2 ] || fail "--assets 后面要给目录"
       ASSETS="$2"
       shift 2
+      ;;
+    --rime-config)
+      [ $# -ge 2 ] || fail "--rime-config 后面要给目录"
+      RIME_CONFIG="$2"
+      shift 2
+      ;;
+    --force-rime)
+      FORCE_RIME=1
+      shift
       ;;
     -h | --help)
       usage
@@ -139,6 +152,29 @@ if [ -f "$DEST/Contents/Resources/voice-assets.sha256" ]; then
 fi
 
 say ""
+if [ -n "$RIME_CONFIG" ]; then
+  [ -d "$RIME_CONFIG/Rime" ] || fail "$RIME_CONFIG/Rime 不存在（先跑 export-rime-config.sh）"
+  USER_RIME="$HOME/Library/Rime"
+  if [ -d "$USER_RIME" ] && [ -n "$(ls -A "$USER_RIME" 2>/dev/null)" ]; then
+    if [ "$FORCE_RIME" -eq 1 ]; then
+      BACKUP="$USER_RIME.backup.$(date +%Y%m%d%H%M%S)"
+      say "备份已有配置：$BACKUP"
+      mv "$USER_RIME" "$BACKUP"
+      mkdir -p "$USER_RIME"
+    else
+      say "~/Library/Rime 已有内容，跳过播种（要覆盖加 --force-rime，会先备份）"
+    fi
+  else
+    mkdir -p "$USER_RIME"
+  fi
+  if [ -z "$(ls -A "$USER_RIME" 2>/dev/null)" ] || [ "$FORCE_RIME" -eq 1 ]; then
+    say "播种配置：$RIME_CONFIG/Rime -> $USER_RIME"
+    cp -R "$RIME_CONFIG/Rime/." "$USER_RIME/"
+  fi
+  say "部署（首次会编译词库，可能要几分钟）"
+  "$DEST/Contents/MacOS/Squirrel" --build >/dev/null 2>&1 || say "部署没有成功返回，可在输入法菜单里点「重新部署」再试"
+fi
+
 say "装好了：$DEST"
 say "启用输入源："
 say "  \"$DEST/Contents/MacOS/Squirrel\" --register-input-source"

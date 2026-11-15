@@ -56,3 +56,35 @@ cd code/Client
 swift build --product Squirrel
 ./scripts/make-app.sh
 ```
+
+## 从 GitHub Release 安装（给用户）
+
+Release `v0.1.0` 有三个资产：输入法包本体、识别权重、键盘配置（白霜拼音）。安装一次即可正常打字与语音。
+
+```sh
+mkdir rimeclient && cd rimeclient
+gh release download v0.1.0 --repo Dragonshock/rime-client
+shasum -a 256 -c *.sha256
+
+tar --zstd -xf RimeClient-20261115.tar.zst
+tar --zstd -xf models-qwen3-asr-0.6b-4bit.tar.zst -C RimeClient-20261115/assets
+mkdir -p RimeClient-20261115/rime && tar --zstd -xf rime-config.tar.zst -C RimeClient-20261115/rime
+
+cd RimeClient-20261115
+scripts/install-app.sh --assets "$PWD/assets" --rime-config "$PWD/rime"
+```
+
+`install-app.sh` 会：停掉在跑的旧进程 → 把权重与 `mlx.metallib` 补进包并重签 → 复制到 `~/Library/Input Methods/RimeClient.app` → 校验签名与包内资产 → **仅当 `~/Library/Rime` 为空时**播种键盘配置 → 触发一次部署编译词库（首次几分钟）。
+
+要覆盖已有配置用 `--force-rime`，它会先把旧目录改名备份。
+
+### 分发时踩过的三个坑
+
+1. **`--build` 原来是空跑。** 它没有设置 `shared_data_dir` 与 `user_data_dir`，librime 走默认路径，返回 `true` 但什么都不生成。现在两个目录都显式设置，并在终端打印 `deploy finished <bool>`。
+2. **`--assets` 与 `--rime-config` 默认路径**改成先看脚本旁边的 `RimeClient.app`，封装包里的布局才找得到。
+3. **`export-rime-config.sh` 的 rsync 用了 `-RL`**，`-R` 是 `--relative` 不是递归，结果导出 0 个文件。改成 `-rL`。
+
+### 尚未在本机验证的
+
+- 真·全新用户目录的一次完整安装（本机 `~/Library/Rime` 已有配置，用 `RIME_USER_DIR` 覆盖口验证过播种与部署能生成 63 MB 的 `build/`，但没在真正的空家目录上走过一遍）。
+- 另一台机器上 Gatekeeper 是否放行。包是本机签名（adhoc，无 Team ID），被拦时执行一次 `xattr -dr com.apple.quarantine ~/Library/Input\ Methods/RimeClient.app`。
