@@ -17,7 +17,8 @@ typedef void (*voice_text_fn)(uint64_t session, const char *utf8, int is_final, 
 /* 一行 JSON 的回复。键就是 RecognitionReplyParser 读的六个：
    session(number)、text(string)、decoded(bool)、kind("final"|"partial")、
    ok(bool)、message(string)。末尾不带换行，只在这条回调返回前有效。
-   定稿失败时这里发一行 ok=false，message 是原因，文本为空。 */
+   定稿失败时这里发一行 ok=false，message 是原因，文本为空。
+   kind 还有第三种 "replaced"：同号的旧会话被替换掉，文本为空，只进日志。 */
 typedef void (*voice_reply_fn)(const char *json_line, void *ctx);
 
 /* 模型目录打不开时返回空指针。Swift 见到空指针就不创建会话。
@@ -26,10 +27,17 @@ typedef void (*voice_reply_fn)(const char *json_line, void *ctx);
 void *voice_engine_new(const char *model_dir, const char *metallib);
 void voice_engine_free(void *engine);
 
-/* 返回 0 表示引擎已接受。非 0 表示未接受。 */
+/* 返回 0 表示引擎已接受。非 0 表示未接受。
+   begin 撞上引擎里还挂着的同号会话时不拒绝：先丢掉那枚旧会话（解码器与状态一起
+   释放），再按这次的热词建新的。替换会从 reply_sink 发一行 kind="replaced"。 */
 int voice_session_begin(void *engine, uint64_t session, const char *hotwords_or_null);
 int voice_session_feed(void *engine, uint64_t session, const int16_t *pcm, size_t n);
 int voice_session_finish(void *engine, uint64_t session);
+
+/* 丢掉引擎侧的一枚会话，释放它的解码器与状态，号随即可以再用。
+   取消（失焦、看门狗）不发 finish，用这一句收场。没有那枚会话也返回 0；
+   引擎指针为空返回 -1。 */
+int voice_session_discard(void *engine, uint64_t session);
 
 void voice_engine_set_callback(void *engine, voice_text_fn fn, void *ctx);
 

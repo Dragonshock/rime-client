@@ -8,6 +8,8 @@ import Foundation
 /// 定稿失败时把引擎给出的原因读出来，交给 `VoiceHandleGate` 写进 `voice.log`。
 public final class VoiceEngine: RecognitionTransport {
     public static let notLinkedMessage = "引擎未链入"
+    /// 引擎替换掉同号旧会话时那一行回复的 `kind`。它不是回包，只进日志。
+    static let replacedKind = "replaced"
 
     /// 未链入或模型目录打不开时的原因。引擎已建立则为 nil。
     public let unavailableReason: String?
@@ -99,6 +101,9 @@ public final class VoiceEngine: RecognitionTransport {
 
     public func send(_ command: RecognitionCommand) {
         if let unavailableReason {
+            // 丢弃不是一次识别请求，不回包：引擎没起来这件事已经由 `begin` 那一行说过了，
+            // 取消时再补一行 `rejected` 只会把日志读歪。
+            if case .discard = command { return }
             onReply(RecognitionReply(
                 sessionID: sessionID(of: command),
                 text: nil,
@@ -125,6 +130,8 @@ public final class VoiceEngine: RecognitionTransport {
             if code != 0 {
                 reject(sessionID, lastErrorReason() ?? "定稿未被接受")
             }
+        case .discard(let sessionID):
+            discard(session: sessionID)
         case .stop:
             stop()
         }
@@ -158,6 +165,15 @@ public final class VoiceEngine: RecognitionTransport {
         return symbols.finish(engine, session)
     }
 
+    /// 取消时让引擎也把那一枚会话丢掉（解码器与状态一起释放，号随即可以再用）。
+    ///
+    /// 老归档里没有 `voice_session_discard` 这个符号：那就一条不发，也不报错——
+    /// 那时的行为就是现状（引擎表里留一枚挂着不用的会话）。
+    private func discard(session: UInt64) {
+        guard let symbols, let engine, let discard = symbols.discard else { return }
+        _ = discard(engine, session)
+    }
+
     private func reject(_ sessionID: UInt64, _ message: String) {
         onReply(RecognitionReply(
             sessionID: sessionID,
@@ -183,7 +199,7 @@ public final class VoiceEngine: RecognitionTransport {
 
     private func sessionID(of command: RecognitionCommand) -> UInt64? {
         switch command {
-        case .start(let sessionID, _), .feed(let sessionID, _), .finish(let sessionID):
+        case .start(let sessionID, _), .feed(let sessionID, _), .finish(let sessionID), .discard(let sessionID):
             return sessionID
         case .stop:
             return nil
@@ -218,6 +234,13 @@ private let voiceReplyTrampoline: VoiceSymbols.ReplyFn = { line, raw in
     guard let raw, let line else { return }
     let box = Unmanaged<CallbackBox>.fromOpaque(raw).takeUnretainedValue()
     guard let reply = RecognitionReplyParser.parse(String(cString: line)) else { return }
+    // 引擎把同号的旧会话替换掉时的一行。它不是回包，不派给门：只进日志，
+    // 号在前，与 begin / abandoned / final / rejected 四种行对齐。
+    if reply.kind == VoiceEngine.replacedKind {
+        let number = reply.sessionID.map(String.init) ?? "-"
+        VoiceLog.write("voice session \(number) replaced \(reply.message ?? "-")")
+        return
+    }
     box.onReply(reply)
 }
 
@@ -239,6 +262,8 @@ private struct VoiceSymbols {
         Int
     ) -> Int32
     typealias Finish = @convention(c) (UnsafeMutableRawPointer?, UInt64) -> Int32
+    /// 老归档没有这一枚。没有就退回现状：取消时只停采集，不告诉引擎。
+    typealias Discard = @convention(c) (UnsafeMutableRawPointer?, UInt64) -> Int32
     typealias TextFn = @convention(c) (
         UInt64,
         UnsafePointer<CChar>?,
@@ -270,6 +295,7 @@ private struct VoiceSymbols {
     var begin: Begin
     var feed: Feed
     var finish: Finish
+    var discard: Discard?
     var setCallback: SetCallback
     /// 旧归档没有这一对。缺了就退回文本指针，形状仍由本侧补齐。
     var setReplySink: SetReplySink?
@@ -289,6 +315,7 @@ private struct VoiceSymbols {
             begin: begin,
             feed: feed,
             finish: finish,
+            discard: symbol("voice_session_discard"),
             setCallback: setCallback,
             setReplySink: symbol("voice_engine_set_reply_sink"),
             lastError: symbol("voice_engine_last_error")

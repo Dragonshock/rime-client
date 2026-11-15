@@ -1,6 +1,8 @@
 import XCTest
 @testable import VoiceInterface
 
+/// 同上：每条用例一枚独立编号源，号从 1 起算；共享计数器的行为在
+/// `VoiceSessionNumberTests` 里证。
 final class VoiceMachineTests: XCTestCase {
     private func host(preedit: String = "", bundle: String? = "com.example.notes") -> HostSnapshot {
         HostSnapshot(clientMissing: false, bundleIdentifier: bundle, preedit: preedit)
@@ -14,7 +16,7 @@ final class VoiceMachineTests: XCTestCase {
     }
 
     func testPressWithoutClientDoesNotOpen() {
-        var machine = VoiceMachine(configuredKey: ModifierKeycode.rightOption)
+        var machine = VoiceMachine(configuredKey: ModifierKeycode.rightOption, numbers: VoiceSessionNumbers())
         let (consumed, effects) = machine.handle(
             VoiceKeyEvent(keyCode: ModifierKeycode.rightOption, phase: .flagsChanged(pressed: true)),
             host: HostSnapshot(clientMissing: true, bundleIdentifier: nil, preedit: "")
@@ -25,7 +27,11 @@ final class VoiceMachineTests: XCTestCase {
     }
 
     func testSecondPressDoesNotOpenAnotherSession() {
-        var machine = VoiceMachine(configuredKey: ModifierKeycode.rightOption, hotwords: ["鼠须管"])
+        var machine = VoiceMachine(
+            configuredKey: ModifierKeycode.rightOption,
+            hotwords: ["鼠须管"],
+            numbers: VoiceSessionNumbers()
+        )
         let first = press(&machine, host: host())
         XCTAssertEqual(first.1, [.startCapture(1, context: "鼠须管")])
         let second = press(&machine, host: host())
@@ -35,7 +41,7 @@ final class VoiceMachineTests: XCTestCase {
     }
 
     func testOtherKeyIsNotTaken() {
-        var machine = VoiceMachine(configuredKey: ModifierKeycode.rightOption)
+        var machine = VoiceMachine(configuredKey: ModifierKeycode.rightOption, numbers: VoiceSessionNumbers())
         let (consumed, _) = machine.handle(
             VoiceKeyEvent(keyCode: 0, phase: .keyDown),
             host: host()
@@ -44,7 +50,7 @@ final class VoiceMachineTests: XCTestCase {
     }
 
     func testPartialShowsAndDoesNotCommit() {
-        var machine = VoiceMachine(configuredKey: ModifierKeycode.rightOption)
+        var machine = VoiceMachine(configuredKey: ModifierKeycode.rightOption, numbers: VoiceSessionNumbers())
         _ = press(&machine, host: host())
         let effects = machine.acceptPartial(sessionID: 1, text: "下面是一段", host: host())
         XCTAssertEqual(effects, [.show(sessionID: 1, text: "下面是一段", caretUTF16: "下面是一段".utf16.count)])
@@ -52,7 +58,7 @@ final class VoiceMachineTests: XCTestCase {
     }
 
     func testEmptyFinalClearsMatchingCacheWithoutCommit() {
-        var machine = VoiceMachine(configuredKey: ModifierKeycode.rightOption)
+        var machine = VoiceMachine(configuredKey: ModifierKeycode.rightOption, numbers: VoiceSessionNumbers())
         _ = press(&machine, host: host())
         _ = machine.acceptPartial(sessionID: 1, text: "临时", host: host())
         let release = machine.handle(
@@ -66,7 +72,7 @@ final class VoiceMachineTests: XCTestCase {
     }
 
     func testFinalCommitsOriginalAfterClearingVoiceCache() {
-        var machine = VoiceMachine(configuredKey: ModifierKeycode.rightOption)
+        var machine = VoiceMachine(configuredKey: ModifierKeycode.rightOption, numbers: VoiceSessionNumbers())
         _ = press(&machine, host: host())
         _ = machine.acceptPartial(sessionID: 1, text: "今天开会", host: host())
         _ = machine.handle(
@@ -86,7 +92,7 @@ final class VoiceMachineTests: XCTestCase {
     }
 
     func testFinalDoesNotClearKeyboardCache() {
-        var machine = VoiceMachine(configuredKey: ModifierKeycode.rightOption)
+        var machine = VoiceMachine(configuredKey: ModifierKeycode.rightOption, numbers: VoiceSessionNumbers())
         _ = press(&machine, host: host())
         _ = machine.acceptPartial(sessionID: 1, text: "语音", host: host())
         _ = machine.handle(
@@ -104,7 +110,7 @@ final class VoiceMachineTests: XCTestCase {
     }
 
     func testMismatchedPartialIsIgnored() {
-        var machine = VoiceMachine(configuredKey: ModifierKeycode.rightOption)
+        var machine = VoiceMachine(configuredKey: ModifierKeycode.rightOption, numbers: VoiceSessionNumbers())
         _ = press(&machine, host: host())
         let effects = machine.acceptPartial(sessionID: 9, text: "错会话", host: host())
         XCTAssertTrue(effects.isEmpty)
@@ -112,7 +118,7 @@ final class VoiceMachineTests: XCTestCase {
     }
 
     func testAbandonClosesTheSessionAndLetsTheNextPressOpenOne() {
-        var machine = VoiceMachine(configuredKey: ModifierKeycode.rightOption)
+        var machine = VoiceMachine(configuredKey: ModifierKeycode.rightOption, numbers: VoiceSessionNumbers())
         _ = press(&machine, host: host())
         _ = machine.acceptPartial(sessionID: 1, text: "临时", host: host())
         _ = machine.handle(
@@ -127,7 +133,7 @@ final class VoiceMachineTests: XCTestCase {
     }
 
     func testAbandonKeepsForeignPreedit() {
-        var machine = VoiceMachine(configuredKey: ModifierKeycode.rightOption)
+        var machine = VoiceMachine(configuredKey: ModifierKeycode.rightOption, numbers: VoiceSessionNumbers())
         _ = press(&machine, host: host())
         let effects = machine.abandon(sessionID: 1, host: host(preedit: "ni"))
         XCTAssertTrue(effects.isEmpty)
@@ -135,7 +141,7 @@ final class VoiceMachineTests: XCTestCase {
     }
 
     func testExternalAbandonClosesAndDropsRecognitionAndRewrite() {
-        var machine = VoiceMachine(configuredKey: ModifierKeycode.rightOption)
+        var machine = VoiceMachine(configuredKey: ModifierKeycode.rightOption, numbers: VoiceSessionNumbers())
         _ = press(&machine, host: host())
         _ = machine.acceptPartial(sessionID: 1, text: "临时", host: host())
         XCTAssertNotNil(machine.session?.recognition)
@@ -154,7 +160,7 @@ final class VoiceMachineTests: XCTestCase {
     }
 
     func testExternalAbandonDoesNotClearPreeditThroughShow() {
-        var machine = VoiceMachine(configuredKey: ModifierKeycode.rightOption)
+        var machine = VoiceMachine(configuredKey: ModifierKeycode.rightOption, numbers: VoiceSessionNumbers())
         _ = press(&machine, host: host())
         _ = machine.acceptPartial(sessionID: 1, text: "临时", host: host())
         // 引擎拒绝走的那条 abandon 会发一条空 show；外部取消不发，连缓存都不留。
@@ -164,7 +170,7 @@ final class VoiceMachineTests: XCTestCase {
     }
 
     func testExternalAbandonIsIdempotent() {
-        var machine = VoiceMachine(configuredKey: ModifierKeycode.rightOption)
+        var machine = VoiceMachine(configuredKey: ModifierKeycode.rightOption, numbers: VoiceSessionNumbers())
         XCTAssertTrue(machine.abandon(reason: .watchdog).isEmpty)
         XCTAssertNil(machine.session)
 
@@ -178,7 +184,7 @@ final class VoiceMachineTests: XCTestCase {
     }
 
     func testExternalAbandonAfterReleaseStillYieldsNoEffects() {
-        var machine = VoiceMachine(configuredKey: ModifierKeycode.rightOption)
+        var machine = VoiceMachine(configuredKey: ModifierKeycode.rightOption, numbers: VoiceSessionNumbers())
         _ = press(&machine, host: host())
         let release = machine.handle(
             VoiceKeyEvent(keyCode: ModifierKeycode.rightOption, phase: .flagsChanged(pressed: false)),

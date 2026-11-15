@@ -169,7 +169,7 @@ public final class VoiceEngineWarmup {
 ///
 /// - `.start`：按 `budget` 有上限地等。等到了就交出去；没等到就发一行拒绝，
 ///   让 `VoiceHandleGate` 那边把会话收尾——有声地失败，不无声挂住。
-/// - `.feed` / `.finish` / `.stop`：一次也不等。引擎没好之前直接丢掉，
+/// - `.feed` / `.finish` / `.discard` / `.stop`：一次也不等。引擎没好之前直接丢掉，
 ///   那次会话已经由那行拒绝收尾了。
 public final class VoiceEnginePreheatedTransport: RecognitionTransport {
     private let warmup: VoiceEngineWarmup
@@ -213,7 +213,7 @@ public final class VoiceEnginePreheatedTransport: RecognitionTransport {
                 VoiceLog.write(String(format: "首键等了 %.2f 秒，%@", waited, warmup.summary))
             }
             engine.send(command)
-        case .feed, .finish, .stop:
+        case .feed, .finish, .discard, .stop:
             warmup.engineIfReady()?.send(command)
         }
     }

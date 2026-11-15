@@ -82,6 +82,18 @@ def handle_finish(message):
     })
 
 
+def handle_discard(message):
+    """取消之后丢掉这一枚：这条路上没有引擎会话表，放掉本进程的 stream 状态就行。
+
+    不回包：丢弃不是一次识别结果，回了反而让调用方多写一行 `rejected`。
+    """
+    global state, session_id
+    if message.get("session") != session_id:
+        return
+    state = None
+    session_id = None
+
+
 def main():
     for line in sys.stdin:
         line = line.strip()
@@ -100,6 +112,8 @@ def main():
                 handle_feed(message)
             elif cmd == "finish":
                 handle_finish(message)
+            elif cmd == "discard":
+                handle_discard(message)
             elif cmd == "stop":
                 reply({"ok": True, "kind": "stopped"})
                 return

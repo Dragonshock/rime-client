@@ -40,17 +40,48 @@ public enum VoiceEffect: Equatable, Sendable {
     case commit(sessionID: UInt64, text: String)
 }
 
+/// 会话号的来源。`shared` 是全进程一份：换窗口之后 `IMKInputController` 是新实例、门也是新的，
+/// 但号从同一个计数器上取，不会把 1 再发给一个还挂在引擎会话表里的旧会话。
+public final class VoiceSessionNumbers: @unchecked Sendable {
+    private let lock = NSLock()
+    private var issued: UInt64
+
+    /// `startingAt` 是「已经发出去的最大号」，第一枚会话是 `startingAt + 1`。
+    /// 默认 0，于是单枚独立计数器从 1 开始，与共享计数器未发号时的取值一致。
+    public init(startingAt issued: UInt64 = 0) {
+        self.issued = issued
+    }
+
+    public func next() -> UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        issued &+= 1
+        return issued
+    }
+
+    /// 进程级共享的那一枚。引擎会话表在引擎进程里，号必须跟着进程走，不能跟着门走。
+    public static let shared = VoiceSessionNumbers()
+}
+
 public struct VoiceMachine {
     public private(set) var session: VoiceSession?
+    /// 只作本机流水：上一枚号加一。真正的取号在 `numbers` 上，这个值不参与分配。
     public private(set) var nextID: UInt64
     public var configuredKey: UInt16?
     public var hotwords: [String]?
+    /// 号从哪来。默认是进程级共享的那一枚；测试可以塞一枚自己的。
+    public let numbers: VoiceSessionNumbers
 
-    public init(configuredKey: UInt16? = nil, hotwords: [String]? = nil) {
+    public init(
+        configuredKey: UInt16? = nil,
+        hotwords: [String]? = nil,
+        numbers: VoiceSessionNumbers = .shared
+    ) {
         self.session = nil
         self.nextID = 1
         self.configuredKey = configuredKey
         self.hotwords = hotwords
+        self.numbers = numbers
     }
 
     public mutating func handle(
@@ -156,8 +187,8 @@ public struct VoiceMachine {
     private mutating func press(host: HostSnapshot) -> [VoiceEffect] {
         if let current = session, current.life == .open { return [] }
         guard !host.clientMissing else { return [] }
-        let id = nextID
-        nextID += 1
+        let id = numbers.next()
+        nextID = id &+ 1
         session = .opened(id: id, bundleIdentifier: host.bundleIdentifier)
         return [.startCapture(id, context: HotwordString.project(hotwords))]
     }
@@ -173,6 +204,12 @@ public struct VoiceMachine {
         guard var current = session else { return [] }
         guard intent.sessionID == current.id, current.life == .open else { return [] }
         guard current.deliveryAllowed, !host.clientMissing, host.bundleIdentifier == current.bundleIdentifier else {
+            // 交付被拒要留下原因，否则界面上只看到「没上屏」，无从判断是没识别还是被守卫拦下。
+            VoiceLog.write(
+                "delivery rejected session \(intent.sessionID) kind=\(intent.kind) "
+                    + "allowed=\(current.deliveryAllowed) clientMissing=\(host.clientMissing) "
+                    + "opened=\(current.bundleIdentifier ?? "nil") now=\(host.bundleIdentifier ?? "nil")"
+            )
             return []
         }
         switch intent.kind {

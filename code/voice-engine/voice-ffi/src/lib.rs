@@ -121,6 +121,21 @@ pub unsafe extern "C" fn voice_session_finish(engine: *mut c_void, session: u64)
     worker.finish(session)
 }
 
+/// 丢掉引擎侧的一枚会话：解码器与状态一起释放，号随即可以再用。
+///
+/// 取消路径（失焦、看门狗）只停采集、不发 `finish`，引擎表里那一枚会话原本会一直
+/// 挂着占号占内存。这一句是那个收场的手：没有那枚会话也回 0，取消本来就允许重复。
+///
+/// # Safety
+/// `engine` 必须仍有效（或为空指针，此时返回 -1）。
+#[no_mangle]
+pub unsafe extern "C" fn voice_session_discard(engine: *mut c_void, session: u64) -> c_int {
+    let Some(worker) = worker_ref(engine) else {
+        return -1;
+    };
+    worker.discard(session)
+}
+
 /// 设置整段文本的回调。函数指针为空时清掉回调。
 ///
 /// # Safety
@@ -225,8 +240,8 @@ fn model_dir_opens(dir: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    /// 头文件里的九个声明。
-    const ABI_DECLARATIONS: [&str; 9] = [
+    /// 头文件里的十个声明。
+    const ABI_DECLARATIONS: [&str; 10] = [
         "voice_text_fn",
         "voice_reply_fn",
         "voice_engine_new",
@@ -234,6 +249,7 @@ mod tests {
         "voice_session_begin",
         "voice_session_feed",
         "voice_session_finish",
+        "voice_session_discard",
         "voice_engine_set_callback",
         "voice_engine_set_reply_sink",
     ];
@@ -286,10 +302,10 @@ mod tests {
     }
 
     #[test]
-    fn header_lists_nine_declarations() {
+    fn header_lists_ten_declarations() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("include/voice_engine.h");
         let text = std::fs::read_to_string(&path).expect("voice_engine.h");
-        assert_eq!(ABI_DECLARATIONS.len(), 9);
+        assert_eq!(ABI_DECLARATIONS.len(), 10);
         for name in ABI_DECLARATIONS {
             assert!(text.contains(name), "头文件缺少 {name}");
         }
@@ -320,6 +336,10 @@ mod tests {
         );
         assert_eq!(unsafe { voice_session_finish(std::ptr::null_mut(), 1) }, -1);
         assert_eq!(
+            unsafe { voice_session_discard(std::ptr::null_mut(), 1) },
+            -1
+        );
+        assert_eq!(
             unsafe { voice_engine_last_error(std::ptr::null_mut(), std::ptr::null_mut(), 0) },
             -1
         );
@@ -346,8 +366,10 @@ mod tests {
         )
         .expect("线程");
         let caller = thread::current().name().map(str::to_string);
+        // 同号 `begin` 的语义（替换旧会话，不再拒绝）由下面
+        // `same_number_begin_replaces_the_old_session` 专门证；这条只管
+        // `feed` / `finish` 走完 `voice-asr`。
         assert_eq!(worker.begin(7, Some("专名".to_string())), 0);
-        assert_eq!(worker.begin(7, None), -1);
         assert_eq!(worker.feed(7, vec![0; 31_999]), 0);
         assert_eq!(worker.feed(7, vec![1]), 0);
         let saw_partial = engine::wait_until(Duration::from_secs(5), || {
@@ -366,6 +388,258 @@ mod tests {
         let record = record.lock().unwrap();
         assert_eq!(record.flags, vec![false, true]);
         drop(record);
+        worker.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 每枚解码器带一个标签与自己的热词：替换之后到底是哪一枚在收 `feed` / `finish`。
+    /// `dropped` 数的是「这枚解码器什么时候被真正释放」。
+    struct TaggedDecoder {
+        tag: &'static str,
+        hotword: &'static str,
+        steps: Arc<Mutex<Vec<(&'static str, bool, bool)>>>,
+        dropped: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Drop for TaggedDecoder {
+        fn drop(&mut self) {
+            self.dropped
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl DecodeText for TaggedDecoder {
+        fn decode_text(&mut self, view: &DecodeView<'_>) -> StepOutput {
+            let saw_hotword = view
+                .prefix
+                .iter()
+                .any(|part| matches!(part, PrefixPart::System(text) if text == self.hotword));
+            self.steps
+                .lock()
+                .unwrap()
+                .push((self.tag, view.is_final, saw_hotword));
+            let text = if view.is_final { "定稿" } else { "部分" };
+            StepOutput {
+                text: text.to_string(),
+                tokens: vec![1, 2, 3],
+            }
+        }
+    }
+
+    #[test]
+    fn same_number_begin_replaces_the_old_session() {
+        let dir = temp_dir();
+        let steps = Arc::new(Mutex::new(Vec::<(&'static str, bool, bool)>::new()));
+        let dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let shared_steps = Arc::clone(&steps);
+        let shared_dropped = Arc::clone(&dropped);
+        // 工厂每次被叫就换一对标签：第一枚是建来又要被替换掉的旧会话，第二枚是新的。
+        let mut warm = true;
+        let worker = Worker::spawn(
+            dir.to_string_lossy().into_owned(),
+            None,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            move |_| {
+                let here = Arc::clone(&shared_steps);
+                let gone = Arc::clone(&shared_dropped);
+                let (tag, hotword) = if warm {
+                    warm = false;
+                    ("旧", "旧热词")
+                } else {
+                    ("新", "新热词")
+                };
+                TaggedDecoder {
+                    tag,
+                    hotword,
+                    steps: here,
+                    dropped: gone,
+                }
+            },
+        )
+        .expect("线程");
+        let lines = Mutex::new(Vec::<String>::new());
+        worker.set_reply_sink(Some(engine::ReplySink {
+            function: collect_json,
+            ctx: &lines as *const Mutex<Vec<String>> as *mut c_void,
+        }));
+
+        assert_eq!(worker.begin(4, Some("旧热词".to_string())), 0);
+        // 同号再来一次：接受，并把那枚旧会话丢掉。
+        assert_eq!(worker.begin(4, Some("新热词".to_string())), 0);
+        assert_eq!(
+            dropped.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "旧会话的解码器应当在替换时就被释放"
+        );
+
+        assert_eq!(worker.feed(4, vec![0; 32_000]), 0);
+        assert_eq!(worker.finish(4), 0);
+        assert_eq!(worker.finish(4), -1);
+
+        {
+            let steps = steps.lock().unwrap();
+            // 两步都只落在新会话上，而且用的是新的热词。
+            assert_eq!(*steps, vec![("新", false, true), ("新", true, true)]);
+            assert!(!steps.iter().any(|(tag, _, _)| *tag == "旧"));
+        }
+        {
+            let lines = lines.lock().unwrap();
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.contains("\"kind\":\"replaced\"")
+                        && line.contains("\"session\":4")),
+                "替换应留一行带号的日志：{lines:?}"
+            );
+        }
+        assert_eq!(
+            dropped.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "定稿之后两枚解码器都已释放"
+        );
+        worker.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 换窗口之后连着三枚新的 `VoiceMachine`：真实路上号由共享计数器依次发 1、2、3。
+    /// 三枚会话各自立起来、各自 `feed` / `finish`，引擎三次都回 0——没有一条 -1。
+    /// 这是「三枚新门各自 begin」在引擎侧的那一半；号不重复那半在
+    /// `VoiceInterfaceTests.testThreeFreshGatesTakeThreeDistinctNumbers`。
+    #[test]
+    fn three_fresh_sessions_begin_in_a_row_are_all_accepted() {
+        use std::sync::atomic::Ordering;
+
+        const TAGS: [&str; 3] = ["一", "二", "三"];
+
+        let dir = temp_dir();
+        let steps = Arc::new(Mutex::new(Vec::<(&'static str, bool, bool)>::new()));
+        let dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let shared_steps = Arc::clone(&steps);
+        let shared_dropped = Arc::clone(&dropped);
+        // 工厂按被叫的次数取标签：三枚会话各有一枚带自己热词的解码器。
+        let mut next = 0usize;
+        let worker = Worker::spawn(
+            dir.to_string_lossy().into_owned(),
+            None,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            move |_| {
+                let tag = TAGS[next];
+                next += 1;
+                TaggedDecoder {
+                    tag,
+                    hotword: tag,
+                    steps: Arc::clone(&shared_steps),
+                    dropped: Arc::clone(&shared_dropped),
+                }
+            },
+        )
+        .expect("线程");
+
+        let mut begins = Vec::new();
+        for (index, tag) in TAGS.iter().enumerate() {
+            begins.push(worker.begin(index as u64 + 1, Some(tag.to_string())));
+        }
+        assert_eq!(
+            begins,
+            vec![0, 0, 0],
+            "三枚新门各按自己的号 begin，引擎三次都该接受：{begins:?}"
+        );
+
+        for session in 1..=3u64 {
+            assert_eq!(worker.feed(session, vec![0; 32_000]), 0);
+        }
+        assert!(
+            engine::wait_until(Duration::from_secs(10), || {
+                steps.lock().unwrap().len() == 3
+            }),
+            "三枚会话都该各自跑出一步：{:?}",
+            steps.lock().unwrap()
+        );
+        for session in 1..=3u64 {
+            assert_eq!(
+                worker.finish(session),
+                0,
+                "会话 {session} 应当还在表里，能定稿"
+            );
+        }
+
+        {
+            let steps = steps.lock().unwrap();
+            assert_eq!(steps.len(), 6, "三枚各两步：{steps:?}");
+            for tag in TAGS {
+                let mine: Vec<_> = steps.iter().filter(|(step_tag, _, _)| *step_tag == tag).collect();
+                assert_eq!(mine.len(), 2, "{tag} 该有一中一定稿：{steps:?}");
+                assert_eq!(
+                    mine.iter().map(|(_, final_, seen)| (*final_, *seen)).collect::<Vec<_>>(),
+                    vec![(false, true), (true, true)],
+                    "{tag} 的两步都该带自己的热词"
+                );
+            }
+        }
+        assert_eq!(
+            dropped.load(Ordering::SeqCst),
+            3,
+            "定稿之后三枚解码器都已释放"
+        );
+        worker.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn discard_drops_the_session_so_the_same_number_begins_again() {
+        let dir = temp_dir();
+        let steps = Arc::new(Mutex::new(Vec::<(&'static str, bool, bool)>::new()));
+        let dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let shared_steps = Arc::clone(&steps);
+        let shared_dropped = Arc::clone(&dropped);
+        let mut warm = true;
+        let worker = Worker::spawn(
+            dir.to_string_lossy().into_owned(),
+            None,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            move |_| {
+                let (tag, hotword) = if warm {
+                    warm = false;
+                    ("旧", "旧热词")
+                } else {
+                    ("新", "新热词")
+                };
+                TaggedDecoder {
+                    tag,
+                    hotword,
+                    steps: Arc::clone(&shared_steps),
+                    dropped: Arc::clone(&shared_dropped),
+                }
+            },
+        )
+        .expect("线程");
+
+        assert_eq!(worker.begin(6, Some("旧热词".to_string())), 0);
+        assert_eq!(worker.feed(6, vec![0; 32_000]), 0);
+        assert!(engine::wait_until(Duration::from_secs(5), || {
+            !steps.lock().unwrap().is_empty()
+        }));
+
+        // 取消那条路：只丢会话，不请引擎定稿。
+        assert_eq!(worker.discard(6), 0);
+        assert_eq!(
+            dropped.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "丢掉的会话应连同解码器一起释放"
+        );
+        assert_eq!(worker.finish(6), -1, "丢掉之后这一枚已经不在表里");
+        assert_eq!(worker.discard(6), 0, "重复丢弃仍是 0，不是一次失败");
+
+        // 号回来了：同号还能开，而且 `feed` / `finish` 走的是新会话。
+        assert_eq!(worker.begin(6, Some("新热词".to_string())), 0);
+        assert_eq!(worker.feed(6, vec![0; 32_000]), 0);
+        assert_eq!(worker.finish(6), 0);
+        let steps = steps.lock().unwrap();
+        assert_eq!(
+            *steps,
+            vec![("旧", false, true), ("新", false, true), ("新", true, true)],
+            "旧会话只留下它那一步，丢掉的之后不再参与"
+        );
         worker.shutdown();
         let _ = std::fs::remove_dir_all(&dir);
     }

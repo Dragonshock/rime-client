@@ -23,11 +23,12 @@ public final class VoiceHandleGate {
         host: VoiceFieldHost,
         transport: RecognitionTransport,
         capture: PCMSource,
+        numbers: VoiceSessionNumbers = .shared,
         callbackQueue: DispatchQueue = .main,
         watchdogSeconds: TimeInterval = VoiceHandleGate.defaultWatchdogSeconds,
         watchdogQueue: DispatchQueue = DispatchQueue(label: "rime.voice.watchdog")
     ) {
-        self.machine = VoiceMachine(configuredKey: configuredKey, hotwords: hotwords)
+        self.machine = VoiceMachine(configuredKey: configuredKey, hotwords: hotwords, numbers: numbers)
         self.host = host
         self.transport = transport
         self.capture = capture
@@ -86,6 +87,9 @@ public final class VoiceHandleGate {
         // 先停采集再写日志：日志那一行意味着麦克风已经不往里报了。
         // 机器返回的效果在这里故意不执行：取消不碰文本框，一条 show / commit 也不发。
         capture.stop()
+        // 取消不发 `finish`，引擎侧那一枚会话本来就没人收场：让它把解码器与状态释放掉，
+        // 号也就能再用。老引擎没有这个符号时这一步什么都不发，不报错。
+        transport.send(.discard(sessionID: sessionID))
         VoiceLog.write("voice session \(sessionID) abandoned \(reason.label)")
         return true
     }
@@ -97,11 +101,20 @@ public final class VoiceHandleGate {
         return machine.session?.life
     }
 
+    /// 只读：当前（或最近一枚）会话的号。撞号时先看这个，再看日志里的 `begin` / `abandoned`。
+    public var sessionID: UInt64? {
+        lock.lock()
+        defer { lock.unlock() }
+        return machine.session?.id
+    }
+
     private func perform(_ effects: [VoiceEffect]) {
         for effect in effects {
             switch effect {
             case .startCapture(let sessionID, let context):
                 transport.send(.start(sessionID: sessionID, context: context))
+                // 号与来源一起写进去：撞号时「哪个号、哪个客户端」一行就能对上。
+                VoiceLog.write("voice session \(sessionID) begin bundle=\(host?.voiceBundleIdentifier ?? "-")")
                 capture.start { [weak self] frame in
                     self?.push(frame)
                 }
@@ -164,13 +177,20 @@ public final class VoiceHandleGate {
         }
     }
 
+    /// 带号的日志行。拿不到号时退回不带号的老形状，宁可少一点信息也不写一个假号。
+    private func label(sessionID: UInt64?, _ rest: String) -> String {
+        guard let sessionID else { return rest }
+        return "voice session \(sessionID) \(rest)"
+    }
+
     private func applyReply(_ reply: RecognitionReply) {
         guard let host else { return }
         guard reply.ok, let sessionID = reply.sessionID else {
             let message = reply.message ?? ""
             if loggedRejection != message {
                 loggedRejection = message
-                VoiceLog.write("recognition rejected \(message)")
+                // 号在前：撞号时这一行与上一条 `begin` 能一眼对上。
+                VoiceLog.write(label(sessionID: reply.sessionID, "rejected \(message)"))
             }
             guard let sessionID = reply.sessionID else { return }
             lock.lock()
@@ -186,7 +206,10 @@ public final class VoiceHandleGate {
         let snapshot = host.voiceSnapshot()
         machine.noteClient(snapshot)
         let effects: [VoiceEffect]
+        // 定稿只有落到「此刻还开着的那一枚」上才算数；迟到的、号不对的都记成没落到。
+        var settledAsFinal = false
         if reply.kind == "final" {
+            settledAsFinal = machine.session.map { $0.id == sessionID && $0.life == .open } ?? false
             effects = machine.acceptFinal(sessionID: sessionID, text: reply.text ?? "", host: snapshot)
         } else if reply.decoded, let text = reply.text {
             effects = machine.acceptPartial(sessionID: sessionID, text: text, host: snapshot)
@@ -194,6 +217,9 @@ public final class VoiceHandleGate {
             effects = []
         }
         lock.unlock()
+        if settledAsFinal {
+            VoiceLog.write("voice session \(sessionID) final")
+        }
         perform(effects)
         noteReply(sessionID)
     }

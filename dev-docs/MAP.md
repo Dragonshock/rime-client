@@ -21,7 +21,7 @@
 ⚠️ **本区不吸收其他区的内容**：目标与优化轴归「目录目标」，目录/git 拓扑归 code-root，
 用户钉死的方向归「已确立」，用户说先不做的归「用户延后」，refs 定位归「refs 索引」。本区只写一句定位）
 <!-- 格式：一行纯文本，不带列表符号。禁止出现优先级分级词（见顶部与 GUIDE §1）。 -->
-语音会话的两条兜底已落地并装包：失焦与看门狗都能停采集且一条文本都不提交；仍会漏的是「引擎持续回非空部分结果」与「授权回调交错」两种边角。
+换窗口语音失效的两处改动（进程一份的会话号、取消时丢掉引擎里那一枚、同号 begin 改成替换）已验收并装进 `~/Library/Input Methods/RimeClient.app`，真机上切换窗口那一步仍未覆盖。
 
 ## 目录目标
 （这个目录**为什么存在、要达成什么**。当前状态说"现在在哪"，本区说"要去哪"。
@@ -171,7 +171,8 @@
 - 回调是否真的到达过一次仍未知：voice.log 的两行 audio engine started 也能由两个 IMKInputController 各按一次解释（下一步：在 receive 里记一行会话号与 kind，再看一次日志｜来源：探索）
 - 看门狗按「最后一次回话」起算：松手丢了而引擎一直回非空部分结果时窗口被一次次续上，麦克风不会停；纯静音不会续窗，空串部分结果不下发（下一步：先量一次真实长句与连续说话的中位时长，再决定要不要另加一条按住时长上限｜来源：探索）
 - 麦克风授权回调与取消交错时采集会被重新起起来：`EnginePCMSource.start` 的 `granted` 分支不看 `running`，会话已被取消之后仍会 `startEngine`，此时表已撤、`push` 只丢帧（下一步：授权回调里先看 `running` 再 `startEngine`，并补一条走假授权的用例｜来源：探索）
-- 多枚输入控制器各自一枚门与采集：`voiceGate` 与 `EnginePCMSource` 都是每个实例一份，取消只作用于被系统调到的那个实例（下一步：在 voice.log 里同时记控制器实例与门会话号，确认实际有几枚实例在活着｜来源：探索）
+- 多枚输入控制器各自一枚门与采集：`voiceGate` 与 `EnginePCMSource` 都是每个实例一份，取消只作用于被系统调到的那个实例；号已改成全进程唯一并写进 `voice.log`，两枚门同时说话不再互撞号，但两个采集源并行的内存与时延没有量过（下一步：在 voice.log 里同时记控制器实例与门会话号，确认实际有几枚实例在活着｜来源：探索）
+- 换窗口之后第一句在真机上没按过：号不重复由 Swift 用例证、三枚号各自 begin 引擎都回 0 由引擎线程用例与 `/tmp/voice-abi/session_probe` 证，但输入源还没启用（`AppleEnabledInputSources` 里没有 `im.dragonshock.inputmethod.RimeClient`），没有真实按键也没有麦克风里的语音（下一步：启用这条输入源，在窗口 A 与窗口 B 各按住右 Option 说一句，看 voice.log 有没有 `rejected 会话未被接受` 或 `replaced`｜来源：探索）
 - Hans 在 TISEnableInputSource 返回 0 之后，输入源列表里的 enabled 仍是 false，HIToolbox 的已启用列表里也没有这条源（下一步：核对注册之后这条源为什么没有写成启用｜来源：探索）
 - 只有一份数值内核（MLX/Metal/arm64）：`voice-tensor` 的 `TensorOps` 第二份实现只有不做数值的 `FakeBackend`，Intel 与 x86_64 从未编过、没有数字（下一步：换后端要凑齐 `TensorOps` 的运算清单并重跑梅尔与编码器、解码器三道闸，容差不改｜来源：探索）
 - 「换一台机器」只在同一台机上换目录验证：`fetch-model.sh`、`make-app.sh`、`install-app.sh` 三条都跑通，但 `LIBRIME_PREFIX` 与带 metal 的 `cargo build` 仍是构建机前置（下一步：找一台没装过本仓库的机器，从取资产跑到装包记一次墙钟｜来源：探索）
@@ -324,3 +325,6 @@ agent 对本区条目：不设计、不预埋扩展点、不当作 gap 去填，
 - 075-derivation-voice-abandon — 从外部取消一条语音会话：为什么取消只停采集不补提交，机器与门的接口形状，状态迁移，以及怎么证明采集真的停了
 - 076-research-voice-guards-wiring — 看门狗窗口 60 秒的理由、计时器为什么走自己的串行队列、撤表三处，以及 deactivateServer 与 commitComposition 的两处接线
 - 077-research-voice-guards-result — 兜底两项的验收与装包结果：38 + 9 条 Swift 用例、61 条 Rust 用例、六段真实语音与装好的包逐字一致，以及麦克风仍可能长开的九种情况
+- 078-derivation-unique-session-ids — 会话号改由进程级共享计数器发：接口与注入点、为什么不是每门自增、`begin` / `abandoned` / `final` / `rejected` 四种带号日志行，以及两门交替与同一门重开不重号的四条用例
+- 079-research-engine-replace-semantics — 引擎侧同号 `begin` 从拒绝改成替换（旧会话连同解码器一起释放，日志多一行带号的 `replaced`）、新增 `voice_session_discard` 给取消路径收场，以及受影响的两条引擎用例与 5 条 ABI 用例逐条对照
+- 080-research-session-collision-fix — 换窗口之后语音失效的定位与验收：两处改动（进程一份的会话号、取消发 `discard` 与同号 `begin` 替换）、三枚新的门各自 begin 的三层证据（Swift 号不重复、引擎三次回 0、真归档 C 探针一号重开与三号连开全为 0）、重编归档与产物并重打重装且签名通过，以及真机切换窗口那一步没有覆盖的实情

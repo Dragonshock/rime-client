@@ -75,6 +75,11 @@ enum Command {
         session: u64,
         reply: mpsc::Sender<i32>,
     },
+    /// 丢掉一枚会话：解码器与状态一起释放，号随即可以再用。
+    Discard {
+        session: u64,
+        reply: mpsc::Sender<i32>,
+    },
     Shutdown,
 }
 
@@ -103,6 +108,20 @@ impl TranscriptSink for SessionSink {
             (callback.function)(self.session, c_text.as_ptr(), flag, callback.ctx);
         }
     }
+}
+
+/// 同号旧会话被替换时的一行。只走 JSON 口：文本口没有位置放一条不带文本的通知。
+///
+/// 一行通知而不是只打 stderr：撞号要能在 `voice.log` 里一眼看到，引擎在这一侧没有
+/// 日志文件，能过界的只有这条回调。旧归档只装了文本口时退回 stderr，不编一条假文本。
+fn emit_replaced(sinks: &Arc<Mutex<Sinks>>, session: u64) {
+    let sinks = *lock(sinks);
+    if let Some(reply) = sinks.reply {
+        let line = crate::json_line::replaced_line(session);
+        emit_json(reply, &line);
+        return;
+    }
+    eprintln!("voice session {session} replaced");
 }
 
 /// 定稿失败时的一行。文本口没有位置放原因，所以只走 JSON 口；
@@ -247,6 +266,24 @@ impl Worker {
         }
     }
 
+    /// 丢掉引擎侧的一枚会话。0 表示这条命令已经处理；引擎已停时返回非 0。
+    ///
+    /// 取消路径不会发 `finish`，这一句是那条路上唯一会释放解码器与状态的调用。
+    pub(crate) fn discard(&self, session: u64) -> i32 {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        if self
+            .tx
+            .send(Command::Discard {
+                session,
+                reply: reply_tx,
+            })
+            .is_err()
+        {
+            return -1;
+        }
+        reply_rx.recv().unwrap_or(-1)
+    }
+
     /// 等到引擎线程调用 `voice-asr` 的 `finish`。0 表示已接受。
     ///
     /// 排在前面的 `Feed` 还没处理完时，引擎线程会先看见这一位，跳过说话中的
@@ -335,10 +372,17 @@ fn drive<H, F>(
             hotwords,
             reply,
         } => {
-            if sessions.contains_key(&session) {
-                let _ = reply.send(-1);
-                return;
+            // 同号会话还在：先把它丢掉（解码器与状态一起释放），再按这次参数建新的。
+            // 撞号不是要拒掉这一路，因为被撞的那一枚已经没有人会来定稿了：换窗口之后
+            // 旧门连同它那枚会话一起没了，075 的取消又故意不发 `finish`，引擎表里那一枚
+            // 只是挂着占号、占解码器。拒掉新的只会让新门那边再撞一次。
+            if let Some(stale) = sessions.remove(&session) {
+                drop(stale);
+                emit_replaced(sinks, session);
             }
+            // 上一位占着号的那枚会话没了，它那面「正在定稿」的旗也跟着作废：
+            // 留着的话新会话的部分步会被整段跳过。
+            finishing.store(false, Ordering::SeqCst);
             let sink = SessionSink {
                 session,
                 sinks: Arc::clone(sinks),
@@ -386,8 +430,20 @@ fn drive<H, F>(
             if let Some(reason) = &reason {
                 emit_failure(sinks, session, reason);
             }
+            // 回话之前就把这一枚连同解码器释放：定稿之后它已经没有用处，而调用线程
+            // 拿着 0 往下走的时候不应该还有一份张量挂在引擎表里。
+            drop(slot);
             *lock(last_error) = reason.clone();
             let _ = reply.send(if reason.is_none() { 0 } else { -1 });
+        }
+        Command::Discard { session, reply } => {
+            // 取消（失焦、看门狗）只停采集，不请引擎定稿，于是引擎侧那一枚要有人收场。
+            // 有没有那枚会话都回 0：取消本来就允许重复，重复丢弃不该变成一次失败。
+            let dropped = sessions.remove(&session).is_some();
+            if dropped {
+                finishing.store(false, Ordering::SeqCst);
+            }
+            let _ = reply.send(0);
         }
         Command::Shutdown => {}
     }

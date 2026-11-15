@@ -4,6 +4,8 @@ public enum RecognitionCommand: Equatable, Sendable {
     case start(sessionID: UInt64, context: String?)
     case feed(sessionID: UInt64, pcm: Data)
     case finish(sessionID: UInt64)
+    /// 丢掉引擎侧的那一枚会话。取消（失焦、看门狗）不发 `finish`，用这一条收场。
+    case discard(sessionID: UInt64)
     case stop
 
     public func jsonLine() -> String {
@@ -31,6 +33,8 @@ public enum RecognitionCommand: Equatable, Sendable {
             ]
         case .finish(let sessionID):
             object = ["cmd": "finish", "session": sessionID]
+        case .discard(let sessionID):
+            object = ["cmd": "discard", "session": sessionID]
         case .stop:
             object = ["cmd": "stop"]
         }

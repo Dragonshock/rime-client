@@ -68,6 +68,7 @@ let package = Package(
                     "-Xlinker", "-u", "-Xlinker", "_voice_session_begin",
                     "-Xlinker", "-u", "-Xlinker", "_voice_session_feed",
                     "-Xlinker", "-u", "-Xlinker", "_voice_session_finish",
+                    "-Xlinker", "-u", "-Xlinker", "_voice_session_discard",
                     "-Xlinker", voiceFfiArchive,
                     "-liconv",
                     "-lc++",

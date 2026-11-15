@@ -73,6 +73,8 @@ private func spin(seconds: TimeInterval) {
     }
 }
 
+/// 每条用例各自注入一枚从 1 起算的编号源，所以断言里的会话号仍是常量。
+/// 默认的进程级共享计数器（换窗口不重号）由 `VoiceSessionNumberTests` 覆盖。
 final class VoiceHandleGateTests: XCTestCase {
     func testPressIsConsumedAndStartsWorkerWithoutCommit() {
         let host = FakeHost()
@@ -84,6 +86,7 @@ final class VoiceHandleGateTests: XCTestCase {
             host: host,
             transport: transport,
             capture: capture,
+            numbers: VoiceSessionNumbers(),
             callbackQueue: .main
         )
         let consumed = gate.consume(
@@ -113,6 +116,7 @@ final class VoiceHandleGateTests: XCTestCase {
             host: host,
             transport: transport,
             capture: capture,
+            numbers: VoiceSessionNumbers(),
             callbackQueue: .main
         )
         _ = gate.consume(VoiceKeyEvent(keyCode: ModifierKeycode.function, phase: .flagsChanged(pressed: true)))
@@ -146,6 +150,7 @@ final class VoiceHandleGateTests: XCTestCase {
             host: host,
             transport: FakeTransport(),
             capture: FakeCapture(),
+            numbers: VoiceSessionNumbers(),
             callbackQueue: .main
         )
         _ = gate.consume(
@@ -181,8 +186,9 @@ final class VoiceHandleGateTests: XCTestCase {
         XCTAssertEqual(
             lines,
             [
-                "recognition rejected No module named 'mlx_qwen3_asr'",
-                "recognition rejected other failure",
+                "voice session 1 begin bundle=com.example.notes",
+                "voice session 1 rejected No module named 'mlx_qwen3_asr'",
+                "voice session 1 rejected other failure",
             ]
         )
         // 被拒之后这个会话已经关闭，不再往旧会话上写预编辑。
@@ -209,7 +215,8 @@ final class VoiceHandleGateTests: XCTestCase {
             hotwords: nil,
             host: host,
             transport: FakeTransport(),
-            capture: FakeCapture()
+            capture: FakeCapture(),
+            numbers: VoiceSessionNumbers()
         )
         XCTAssertFalse(gate.consume(VoiceKeyEvent(keyCode: 0, phase: .keyDown)))
     }
@@ -228,6 +235,7 @@ final class VoiceHandleGateTests: XCTestCase {
             host: host,
             transport: transport,
             capture: capture,
+            numbers: VoiceSessionNumbers(),
             callbackQueue: .main
         )
         XCTAssertTrue(
@@ -247,7 +255,10 @@ final class VoiceHandleGateTests: XCTestCase {
         wait(for: [rejected], timeout: 1)
         XCTAssertEqual(
             lines,
-            ["recognition rejected 当前解码器只能给一个 token（词表下标 5，词片 \"\u{0120}the\"），不是可提交文本"]
+            [
+                "voice session 1 begin bundle=com.example.notes",
+                "voice session 1 rejected 当前解码器只能给一个 token（词表下标 5，词片 \"\u{0120}the\"），不是可提交文本",
+            ]
         )
         XCTAssertTrue(host.commits.isEmpty)
         XCTAssertTrue(host.shows.isEmpty)
@@ -268,6 +279,7 @@ final class VoiceHandleGateTests: XCTestCase {
             host: host,
             transport: FakeTransport(),
             capture: FakeCapture(),
+            numbers: VoiceSessionNumbers(),
             callbackQueue: .main
         )
         _ = gate.consume(VoiceKeyEvent(keyCode: ModifierKeycode.rightOption, phase: .flagsChanged(pressed: true)))
@@ -294,6 +306,34 @@ final class VoiceHandleGateTests: XCTestCase {
         XCTAssertEqual(host.commits, ["今天开会。"])
     }
 
+    /// 取消不发 `finish`，引擎侧那一枚本来就没人收场：门要再发一条丢弃，带的是同一枚号；
+    /// 重复取消（没有开着的会话）一条都不发。
+    func testAbandonAsksTheEngineToDropTheSession() {
+        let host = FakeHost()
+        let transport = FakeTransport()
+        let capture = FakeCapture()
+        let gate = VoiceHandleGate(
+            configuredKey: ModifierKeycode.rightOption,
+            hotwords: nil,
+            host: host,
+            transport: transport,
+            capture: capture,
+            numbers: VoiceSessionNumbers()
+        )
+        _ = gate.consume(VoiceKeyEvent(keyCode: ModifierKeycode.rightOption, phase: .flagsChanged(pressed: true)))
+        XCTAssertTrue(gate.abandon(reason: .watchdog))
+        XCTAssertEqual(
+            transport.lines.filter { $0.contains("\"cmd\":\"discard\"") },
+            ["{\"cmd\":\"discard\",\"session\":1}"]
+        )
+        XCTAssertFalse(gate.abandon(reason: .deactivate))
+        XCTAssertEqual(
+            transport.lines.filter { $0.contains("\"cmd\":\"discard\"") }.count,
+            1,
+            "重复取消不应再丢一次"
+        )
+    }
+
     func testAbandonStopsCaptureAndSendsNoText() {
         var lines: [String] = []
         VoiceLog.sink = { lines.append($0) }
@@ -308,6 +348,7 @@ final class VoiceHandleGateTests: XCTestCase {
             host: host,
             transport: transport,
             capture: capture,
+            numbers: VoiceSessionNumbers(),
             callbackQueue: .main
         )
         XCTAssertTrue(
@@ -340,7 +381,7 @@ final class VoiceHandleGateTests: XCTestCase {
         wait(for: [done], timeout: 1)
         XCTAssertEqual(host.shows, ["甲乙"])
         XCTAssertTrue(host.commits.isEmpty)
-        XCTAssertEqual(lines, ["voice session 1 abandoned deactivate"])
+        XCTAssertEqual(lines, ["voice session 1 begin bundle=com.example.notes", "voice session 1 abandoned deactivate"])
     }
 
     func testSecondAbandonDoesNothing() {
@@ -355,13 +396,14 @@ final class VoiceHandleGateTests: XCTestCase {
             hotwords: nil,
             host: host,
             transport: FakeTransport(),
-            capture: capture
+            capture: capture,
+            numbers: VoiceSessionNumbers()
         )
         _ = gate.consume(VoiceKeyEvent(keyCode: ModifierKeycode.rightOption, phase: .flagsChanged(pressed: true)))
         XCTAssertTrue(gate.abandon(reason: .deactivate))
         XCTAssertFalse(gate.abandon(reason: .watchdog))
         XCTAssertEqual(capture.stopped, 1)
-        XCTAssertEqual(lines.count, 1)
+        XCTAssertEqual(lines, ["voice session 1 begin bundle=com.example.notes", "voice session 1 abandoned deactivate"])
         XCTAssertEqual(gate.sessionLife, .closed)
 
         // 会话已经关掉，下一次按下是新的采集。
@@ -383,6 +425,7 @@ final class VoiceHandleGateTests: XCTestCase {
             host: host,
             transport: transport,
             capture: capture,
+            numbers: VoiceSessionNumbers(),
             callbackQueue: .main
         )
         _ = gate.consume(VoiceKeyEvent(keyCode: ModifierKeycode.rightOption, phase: .flagsChanged(pressed: true)))
@@ -426,6 +469,7 @@ final class VoiceHandleGateTests: XCTestCase {
             host: host,
             transport: transport,
             capture: capture,
+            numbers: VoiceSessionNumbers(),
             callbackQueue: .main,
             watchdogSeconds: 0.05
         )
@@ -441,7 +485,7 @@ final class VoiceHandleGateTests: XCTestCase {
         XCTAssertEqual(capture.stopped, 1)
         XCTAssertFalse(capture.isRunning)
         XCTAssertEqual(gate.sessionLife, .closed)
-        XCTAssertEqual(lines, ["voice session 1 abandoned watchdog"])
+        XCTAssertEqual(lines, ["voice session 1 begin bundle=com.example.notes", "voice session 1 abandoned watchdog"])
         // 看门狗与取消同路：一条文本都不往文本框里走。
         XCTAssertTrue(host.commits.isEmpty)
         XCTAssertTrue(host.shows.isEmpty)
@@ -471,6 +515,7 @@ final class VoiceHandleGateTests: XCTestCase {
             host: host,
             transport: FakeTransport(),
             capture: capture,
+            numbers: VoiceSessionNumbers(),
             callbackQueue: .main,
             watchdogSeconds: 0.05
         )
@@ -486,14 +531,14 @@ final class VoiceHandleGateTests: XCTestCase {
         spin(seconds: 0.2)
         XCTAssertEqual(capture.stopped, 1)
         XCTAssertEqual(gate.sessionLife, .open)
-        XCTAssertEqual(lines, [])
+        XCTAssertEqual(lines, ["voice session 1 begin bundle=com.example.notes"])
 
         // 正常路径不受影响：定稿照样提交。
         gate.receive(RecognitionReply(sessionID: 1, text: "定稿", decoded: true, kind: "final", ok: true, message: nil))
         spin(seconds: 0.05)
         XCTAssertEqual(host.commits, ["定稿"])
         XCTAssertEqual(gate.sessionLife, .closed)
-        XCTAssertEqual(lines, [])
+        XCTAssertEqual(lines, ["voice session 1 begin bundle=com.example.notes", "voice session 1 final"])
     }
 
     func testWatchdogWindowRestartsWhileTheEngineKeepsReplying() {
@@ -509,6 +554,7 @@ final class VoiceHandleGateTests: XCTestCase {
             host: host,
             transport: FakeTransport(),
             capture: capture,
+            numbers: VoiceSessionNumbers(),
             callbackQueue: .main,
             watchdogSeconds: 0.1
         )
@@ -536,7 +582,7 @@ final class VoiceHandleGateTests: XCTestCase {
         spin(seconds: 0.2)
         XCTAssertEqual(capture.stopped, 1)
         XCTAssertEqual(host.commits, ["定稿"])
-        XCTAssertEqual(lines, [])
+        XCTAssertEqual(lines, ["voice session 1 begin bundle=com.example.notes", "voice session 1 final"])
     }
 
     func testWatchdogLeavesTheNextSessionAlone() {
@@ -552,6 +598,7 @@ final class VoiceHandleGateTests: XCTestCase {
             host: host,
             transport: FakeTransport(),
             capture: capture,
+            numbers: VoiceSessionNumbers(),
             callbackQueue: .main,
             watchdogSeconds: 0.05
         )
@@ -578,6 +625,13 @@ final class VoiceHandleGateTests: XCTestCase {
         spin(seconds: 0.2)
         XCTAssertEqual(capture.stopped, 2)
         XCTAssertEqual(gate.sessionLife, .open)
-        XCTAssertEqual(lines, ["voice session 1 abandoned watchdog"])
+        XCTAssertEqual(
+            lines,
+            [
+                "voice session 1 begin bundle=com.example.notes",
+                "voice session 1 abandoned watchdog",
+                "voice session 2 begin bundle=com.example.notes",
+            ]
+        )
     }
 }

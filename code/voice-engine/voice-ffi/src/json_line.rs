@@ -4,6 +4,10 @@
 //! `decoded`、`kind`、`ok`、`message`。解释器那条路（`worker.py`）写同一组键，
 //! 两条路的回复因此同形，解析器只有一处。
 //!
+//! `kind` 有三种：`final` / `partial` 是识别结果，`replaced` 是一条会话生命期通知
+//! （同号的旧会话被替换掉了）。`replaced` 不带文本，Swift 侧只把它写进 `voice.log`，
+//! 不当成一次回包派给门。
+//!
 //! 只做序列化。末尾不加换行；调用方负责复制，字符串只活到这次回调返回。
 
 use std::fmt::Write;
@@ -14,6 +18,20 @@ use std::fmt::Write;
 /// 变化时才发，所以真就表示「这一段是新的」。定稿不看这一位。
 pub(crate) fn reply_line(session: u64, text: &str, kind: &str) -> String {
     compose(session, text, Some(kind), true, true, None)
+}
+
+/// 一条「同号旧会话已被替换」的通知。文本为空，`ok` 为真，`decoded` 为假。
+///
+/// 撞号时先看这一行：它说明引擎在这一侧把那枚旧会话丢掉、按新参数重建了。
+pub(crate) fn replaced_line(session: u64) -> String {
+    compose(
+        session,
+        "",
+        Some("replaced"),
+        true,
+        false,
+        Some("同号旧会话已丢弃"),
+    )
 }
 
 /// 一条失败回复。文本为空，`kind` 不写，`ok` 为假，原因写进 `message`。
@@ -110,6 +128,15 @@ mod tests {
         assert!(
             line.contains("\"text\":\"a\\\"b\\\\c\\nd\\te\\u0001\""),
             "{line}"
+        );
+    }
+
+    #[test]
+    fn replaced_line_carries_no_text_and_says_so_in_the_message() {
+        let line = replaced_line(4);
+        assert_eq!(
+            line,
+            "{\"decoded\":false,\"kind\":\"replaced\",\"message\":\"同号旧会话已丢弃\",\"ok\":true,\"session\":4,\"text\":\"\"}"
         );
     }
 
