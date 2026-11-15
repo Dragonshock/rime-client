@@ -133,4 +133,62 @@ final class VoiceMachineTests: XCTestCase {
         XCTAssertTrue(effects.isEmpty)
         XCTAssertEqual(machine.session?.life, .closed)
     }
+
+    func testExternalAbandonClosesAndDropsRecognitionAndRewrite() {
+        var machine = VoiceMachine(configuredKey: ModifierKeycode.rightOption)
+        _ = press(&machine, host: host())
+        _ = machine.acceptPartial(sessionID: 1, text: "临时", host: host())
+        XCTAssertNotNil(machine.session?.recognition)
+
+        let effects = machine.abandon(reason: .deactivate)
+        XCTAssertTrue(effects.isEmpty)
+        XCTAssertEqual(machine.session?.life, .closed)
+        XCTAssertNil(machine.session?.recognition)
+        XCTAssertNil(machine.session?.rewrite)
+        XCTAssertEqual(machine.session?.abandonReason, .deactivate)
+
+        // 迟到的定稿找不到记录，一条效果也不给。
+        XCTAssertTrue(machine.acceptFinal(sessionID: 1, text: "临时定稿", host: host()).isEmpty)
+        // 下一次按下是新会话。
+        XCTAssertEqual(press(&machine, host: host()).1, [.startCapture(2, context: nil)])
+    }
+
+    func testExternalAbandonDoesNotClearPreeditThroughShow() {
+        var machine = VoiceMachine(configuredKey: ModifierKeycode.rightOption)
+        _ = press(&machine, host: host())
+        _ = machine.acceptPartial(sessionID: 1, text: "临时", host: host())
+        // 引擎拒绝走的那条 abandon 会发一条空 show；外部取消不发，连缓存都不留。
+        let effects = machine.abandon(reason: .deactivate)
+        XCTAssertTrue(effects.isEmpty)
+        XCTAssertNil(machine.session?.lastShown)
+    }
+
+    func testExternalAbandonIsIdempotent() {
+        var machine = VoiceMachine(configuredKey: ModifierKeycode.rightOption)
+        XCTAssertTrue(machine.abandon(reason: .watchdog).isEmpty)
+        XCTAssertNil(machine.session)
+
+        _ = press(&machine, host: host())
+        XCTAssertTrue(machine.abandon(reason: .deactivate).isEmpty)
+        XCTAssertTrue(machine.abandon(reason: .watchdog).isEmpty)
+        // 第二次不换会话、不覆盖第一次的由来。
+        XCTAssertEqual(machine.session?.id, 1)
+        XCTAssertEqual(machine.session?.abandonReason, .deactivate)
+        XCTAssertEqual(press(&machine, host: host()).1, [.startCapture(2, context: nil)])
+    }
+
+    func testExternalAbandonAfterReleaseStillYieldsNoEffects() {
+        var machine = VoiceMachine(configuredKey: ModifierKeycode.rightOption)
+        _ = press(&machine, host: host())
+        let release = machine.handle(
+            VoiceKeyEvent(keyCode: ModifierKeycode.rightOption, phase: .flagsChanged(pressed: false)),
+            host: host(preedit: "临时")
+        )
+        XCTAssertEqual(release.1, [.stopCapture(1)])
+        // 松手之后会话还开着，要等定稿才关；这期间取消照样不发文本。
+        let effects = machine.abandon(reason: .watchdog)
+        XCTAssertTrue(effects.isEmpty)
+        XCTAssertEqual(machine.session?.life, .closed)
+        XCTAssertTrue(machine.acceptFinal(sessionID: 1, text: "临时定稿", host: host(preedit: "临时")).isEmpty)
+    }
 }

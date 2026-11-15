@@ -55,6 +55,23 @@ public struct RewriteRecord: Equatable, Sendable {
     }
 }
 
+/// 外部取消一枚会话时带的由来。只写进日志与 `VoiceSession.abandonReason`，
+/// 不参与效果计算：哪一条路取消都不产生 `show` / `commit`。
+public struct VoiceAbandonReason: Equatable, Sendable, CustomStringConvertible {
+    public let label: String
+
+    public init(_ label: String) {
+        self.label = label
+    }
+
+    public var description: String { label }
+
+    /// 输入框失焦、切走输入源、客户端消失。
+    public static let deactivate = VoiceAbandonReason("deactivate")
+    /// 松手事件没到或按住太久，由看门狗判停。
+    public static let watchdog = VoiceAbandonReason("watchdog")
+}
+
 public enum IntentKind: Equatable, Sendable {
     case preedit
     case commit

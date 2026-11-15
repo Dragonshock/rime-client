@@ -1,0 +1,213 @@
+{
+  "generated_by": "code/voice-oracle/dump_reference.py",
+  "reference_package": "mlx_qwen3_asr 0.4.4（code/voice-worker/.venv，只作对照）",
+  "model_dir": "/Users/dragon/.cache/huggingface/hub/models--moona3k--mlx-qwen3-asr-0.6b-4bit/snapshots/4c59c533f95c84afb796655e814709034f826f04",
+  "model_dtype": "float16",
+  "activation_dtype": "mlx.core.float16",
+  "sample_rate": 16000,
+  "conv_stem_layout": "all_chunks",
+  "audio_input": {
+    "source": "pcm:/Users/dragon/repo/tools/rime-client/code/voice-oracle/assets/zh/s1_4.0.pcm",
+    "file": "input_pcm.bin",
+    "dtype": "int16",
+    "shape": [
+      64000
+    ],
+    "bytes": 128000,
+    "formula": null,
+    "to_float": "pcm.astype(f32) / 32768（与 mlx_qwen3_asr.load_audio 一致）"
+  },
+  "audio_frames": {
+    "mel_frames": 400,
+    "n_audio_tokens": 52,
+    "encoder_output_lens": [
+      52
+    ]
+  },
+  "prompt": {
+    "language": "Chinese",
+    "context": "",
+    "length": 70,
+    "tokens": [
+      151644,
+      8948,
+      198,
+      151645,
+      198,
+      151644,
+      872,
+      198,
+      151669,
+      151676,
+      151676,
+      151676,
+      151676,
+      151676,
+      151676,
+      151676,
+      151676,
+      151676,
+      151676,
+      151676,
+      151676,
+      151676,
+      151676,
+      151676,
+      151676,
+      151676,
+      151676,
+      151676,
+      151676,
+      151676,
+      151676,
+      151676,
+      151676,
+      151676,
+      151676,
+      151676,
+      151676,
+      151676,
+      151676,
+      151676,
+      151676,
+      151676,
+      151676,
+      151676,
+      151676,
+      151676,
+      151676,
+      151676,
+      151676,
+      151676,
+      151676,
+      151676,
+      151676,
+      151676,
+      151676,
+      151676,
+      151676,
+      151676,
+      151676,
+      151676,
+      151676,
+      151670,
+      151645,
+      198,
+      151644,
+      77091,
+      198,
+      11528,
+      8453,
+      151704
+    ]
+  },
+  "greedy": {
+    "tokens": [
+      100644,
+      102172,
+      112055
+    ],
+    "text_from_tokens": "今天下午三点",
+    "reference_generate_tokens": [
+      100644,
+      102172,
+      112055
+    ],
+    "reference_finish_reason": "length",
+    "matches_reference_generate": true
+  },
+  "tensors": [
+    {
+      "key": "mel",
+      "file": "mel.bin",
+      "shape": [
+        128,
+        400
+      ],
+      "dtype": "float32",
+      "bytes": 204800,
+      "source": "mlx_qwen3_asr.audio.log_mel_spectrogram",
+      "note": "参考以 f32 计算后转模型 dtype 送进编码器；这里存转换前的 f32 值"
+    },
+    {
+      "key": "conv_stem_out",
+      "file": "conv_stem_out.bin",
+      "shape": [
+        4,
+        16,
+        13,
+        480
+      ],
+      "dtype": "float32",
+      "bytes": 1597440,
+      "source": "mlx_qwen3_asr.encoder.AudioEncoder._apply_conv_stem",
+      "note": "存的是前向里第一次 _apply_conv_stem 调用的整批输出，第 0 维是整块号（每块 100 梅尔帧），布局为参考的 NHWC (块, 频域 16, 时域 13, 480)；送进 conv_out 前参考会按块 transpose 成 (13, 480*16) 再拼起来。取本张量的 [0] 就是旧 200 帧资产里的 (16, 13, 480)",
+      "captured_from": "首次 _apply_conv_stem 调用的完整输出",
+      "full_call_output_shape": [
+        4,
+        16,
+        13,
+        480
+      ],
+      "all_stem_call_shapes": [
+        [
+          4,
+          16,
+          13,
+          480
+        ]
+      ],
+      "chunks_in_first_call": 4
+    },
+    {
+      "key": "encoder_layer0_out",
+      "file": "encoder_layer0_out.bin",
+      "shape": [
+        1,
+        52,
+        896
+      ],
+      "dtype": "float32",
+      "bytes": 186368,
+      "source": "mlx_qwen3_asr.encoder.AudioEncoderLayer.__call__ (layers[0])",
+      "note": "第 0 层含残差的输出，送入第 1 层；本段音频只有一个注意力窗口，mask 为 None",
+      "covers_full_sequence": true,
+      "total_encoder_tokens": 52
+    },
+    {
+      "key": "encoder_proj_out",
+      "file": "encoder_proj_out.bin",
+      "shape": [
+        52,
+        1024
+      ],
+      "dtype": "float32",
+      "bytes": 212992,
+      "source": "mlx_qwen3_asr.encoder.AudioEncoder._encode_single -> ln_post/gelu(proj1)/proj2",
+      "note": "编码器末尾投影（音频特征），也是注入文本嵌入的张量"
+    },
+    {
+      "key": "prefill_logits_64",
+      "file": "prefill_logits_64.bin",
+      "shape": [
+        64
+      ],
+      "dtype": "float32",
+      "bytes": 256,
+      "source": "mlx_qwen3_asr.model.Qwen3ASRModel.prefill -> lm_head[:, -1:, :64]",
+      "note": "最后一个提示位置的 logits，只落前 64 维（全词表 151936 维）"
+    },
+    {
+      "key": "greedy_tokens_3",
+      "file": "greedy_tokens_3.bin",
+      "shape": [
+        3
+      ],
+      "dtype": "float32",
+      "bytes": 12,
+      "source": "mlx_qwen3_asr.generate._sample(argmax) + Qwen3ASRModel.prefill/step",
+      "note": "贪心解码前 3 个 token，用 f32 存整数；参考 generate 会剥掉末尾 EOS"
+    }
+  ],
+  "unavailable": []
+}

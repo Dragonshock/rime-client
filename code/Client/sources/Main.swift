@@ -7,6 +7,7 @@
 
 import Foundation
 import InputMethodKit
+import VoiceInterface
 
 @main
 struct SquirrelApp {
@@ -126,6 +127,12 @@ struct SquirrelApp {
       let main = Bundle.main
       let connectionName = main.object(forInfoDictionaryKey: "InputMethodConnectionName") as! String
       _ = IMKServer(name: connectionName, bundleIdentifier: main.bundleIdentifier!)
+      // 预热：IMKServer 已经起来、第一次 handle 之前。建引擎跑在后台队列，
+      // 失败只写一行 voice.log，既不挡窗口服务器也不挡 app.run()。
+      VoiceEngineWarmup.shared.start(
+        modelDirectory: VoiceEngine.bundledModelDirectory(),
+        metallibPath: VoiceEngine.bundledMetallib()
+      )
       let app = NSApplication.shared
       let delegate = SquirrelApplicationDelegate()
       app.delegate = delegate

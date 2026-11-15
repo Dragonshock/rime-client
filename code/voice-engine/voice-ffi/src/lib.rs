@@ -18,6 +18,10 @@ use engine::{Callback, ReplySink, TextFn, Worker};
 
 /// 模型目录能读时才启动引擎线程。打不开则返回空指针。
 ///
+/// 返回的时候只装好了第一段（梅尔前端与音频塔）：文本塔留到 `voice_session_begin`
+/// 之后那一步，跟用户说话重叠。需要「两段都装完」的才叫得动：那一次 `finish`
+/// 会等文本塔，不会因为还没装好而给空串。
+///
 /// # Safety
 /// `model_dir` 与 `metallib` 要么为空，要么指向以 NUL 结尾的字节串。
 #[no_mangle]
@@ -61,6 +65,9 @@ pub unsafe extern "C" fn voice_engine_free(engine: *mut c_void) {
 
 /// 按下时开一次会话。热词指针为空或空串时不写入热词。
 ///
+/// 引擎线程回完这个调用之后才开始装文本塔（第二段），所以这里不等那 335 MB；
+/// 接下来的 `feed` 排在有界队列里，等那一步跑完。
+///
 /// # Safety
 /// `engine` 必须仍有效。`hotwords_or_null` 要么为空，要么以 NUL 结尾。
 #[no_mangle]
@@ -101,6 +108,8 @@ pub unsafe extern "C" fn voice_session_feed(
 }
 
 /// 松开。引擎线程收齐后调用 `voice-asr` 的 `finish`。
+///
+/// 文本塔若还没装好（按下就松手），这一步先等它装完再定稿。
 ///
 /// # Safety
 /// `engine` 必须仍有效。
@@ -327,9 +336,14 @@ mod tests {
         }));
         let shared = Arc::clone(&record);
         let dir_text = dir.to_string_lossy().into_owned();
-        let worker = Worker::spawn(dir_text, None, move || RecordingDecoder {
-            record: Arc::clone(&shared),
-        })
+        let worker = Worker::spawn(
+            dir_text,
+            None,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            move |_| RecordingDecoder {
+                record: Arc::clone(&shared),
+            },
+        )
         .expect("线程");
         let caller = thread::current().name().map(str::to_string);
         assert_eq!(worker.begin(7, Some("专名".to_string())), 0);
@@ -352,6 +366,54 @@ mod tests {
         let record = record.lock().unwrap();
         assert_eq!(record.flags, vec![false, true]);
         drop(record);
+        worker.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 第二段装载的两个时刻：`begin` 之后叫一次（与说话重叠），`finish` 之前再叫
+    /// 一次（极短语音也不会拿到空串）。这条不依赖 `metal`：数的是引擎线程上那一步
+    /// 被叫了几次，不是它真读了多少字节。
+    #[test]
+    fn the_second_stage_runs_after_begin_and_again_before_finish() {
+        use std::sync::atomic::Ordering;
+
+        /// 不说话的解码器：这条只数第二段被叫了几次。
+        struct SilentDecoder;
+
+        impl DecodeText for SilentDecoder {
+            fn decode_text(&mut self, _view: &DecodeView<'_>) -> StepOutput {
+                StepOutput {
+                    text: String::new(),
+                    tokens: Vec::new(),
+                }
+            }
+        }
+
+        let dir = temp_dir();
+        let before = backend::DEFERRED.load(Ordering::SeqCst);
+        let worker = Worker::spawn(
+            dir.to_string_lossy().into_owned(),
+            None,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            |_| SilentDecoder,
+        )
+        .expect("线程");
+        assert!(worker.begin(11, None) == 0, "会话应当立起来");
+        // `begin` 回来之后，引擎线程自己把那一步跑了。
+        let after_begin = engine::wait_until(Duration::from_secs(5), || {
+            backend::DEFERRED.load(Ordering::SeqCst) > before
+        });
+        assert!(
+            after_begin,
+            "`begin` 之后应当叫过一次第二段，实得 {}",
+            backend::DEFERRED.load(Ordering::SeqCst) - before
+        );
+        let after_stage = backend::DEFERRED.load(Ordering::SeqCst);
+        assert_eq!(worker.finish(11), 0);
+        assert!(
+            backend::DEFERRED.load(Ordering::SeqCst) > after_stage,
+            "`finish` 之前应当再确认一次第二段"
+        );
         worker.shutdown();
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -490,11 +552,73 @@ mod tests {
         slot.lock().unwrap().push(line);
     }
 
+    /// 记录每一步看到的 `finishing` 位。
+    struct FlagDecoder {
+        flags: Arc<Mutex<Vec<bool>>>,
+        finishing: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl voice_asr::DecodeText for FlagDecoder {
+        fn decode_text(&mut self, view: &voice_asr::DecodeView<'_>) -> voice_asr::StepOutput {
+            self.flags
+                .lock()
+                .unwrap()
+                .push(self.finishing.load(std::sync::atomic::Ordering::SeqCst));
+            let text = if view.is_final { "终" } else { "半" };
+            voice_asr::StepOutput {
+                text: text.to_string(),
+                tokens: vec![1],
+            }
+        }
+    }
+
+    #[test]
+    fn the_decoder_factory_receives_the_finishing_flag() {
+        // 松开时引擎线程靠这一位跳过说话中的部分步。这里只核这一位确实交到了
+        // 会话的解码器手上，并且 finish 之后回到假。
+        let dir = temp_dir();
+        let dir_text = dir.to_string_lossy().into_owned();
+        let seen = Arc::new(Mutex::new(Vec::<bool>::new()));
+        let shared = Arc::clone(&seen);
+        let worker = Worker::spawn(
+            dir_text,
+            None,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            move |finishing| {
+                let here = Arc::clone(&shared);
+                let flag = Arc::clone(finishing);
+                FlagDecoder {
+                    flags: here,
+                    finishing: flag,
+                }
+            },
+        )
+        .expect("线程");
+        assert_eq!(worker.begin(3, None), 0);
+        assert_eq!(worker.feed(3, vec![0; 32_000]), 0);
+        assert!(
+            engine::wait_until(Duration::from_secs(5), || !seen.lock().unwrap().is_empty()),
+            "满 32000 个样本应让引擎线程走一次非定稿步"
+        );
+        assert_eq!(seen.lock().unwrap().first().copied(), Some(false));
+        assert_eq!(worker.finish(3), 0);
+        assert!(
+            !worker.flag_value_for_test(),
+            "finish 之后这一位应回到假，下一次按住才能继续出部分结果"
+        );
+    }
+
     #[test]
     fn finish_failure_reason_reaches_the_json_sink_and_last_error() {
         let dir = temp_dir();
         let dir_text = dir.to_string_lossy().into_owned();
-        let worker = Worker::spawn(dir_text, None, || FailingDecoder).expect("线程");
+        let worker = Worker::spawn(
+            dir_text,
+            None,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            |_| FailingDecoder,
+        )
+        .expect("线程");
         let lines = Mutex::new(Vec::<String>::new());
         worker.set_reply_sink(Some(engine::ReplySink {
             function: collect_json,
@@ -541,7 +665,13 @@ mod tests {
     fn json_sink_replaces_the_text_callback() {
         let dir = temp_dir();
         let dir_text = dir.to_string_lossy().into_owned();
-        let worker = Worker::spawn(dir_text, None, || FailingDecoder).expect("线程");
+        let worker = Worker::spawn(
+            dir_text,
+            None,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            |_| FailingDecoder,
+        )
+        .expect("线程");
         let texts = Mutex::new(Vec::<Event>::new());
         let lines = Mutex::new(Vec::<String>::new());
         worker.set_callback(Some(Callback {

@@ -18,11 +18,15 @@
 use std::fs;
 
 use voice_mel::MelFrontend;
-use voice_parity::{asset_root, compare_tokens, read_f32, read_pcm_i16, Reference};
+use voice_parity::{
+    asset_root, compare_tokens, read_f32, read_pcm_i16, tolerance::MEL_TOLERANCE, Reference,
+};
 
-/// 梅尔容差：参考走 FFT，`voice-mel` 走直接 DFT，求和顺序不同，逐元素允许
-/// 1e-3 的差。这个数来自 050 那次 128×50 的对照，不是为了让失败变成功放宽的。
-const MEL_TOLERANCE: f32 = 1e-3;
+/// 梅尔容差：参考是 numpy 的 f32 实数 FFT，`voice-mel` 是 vDSP 的五条 80 点实数
+/// DFT 再合并（见 notes/062），求和顺序不同，差值与 f16 存储无关，所以这一条用
+/// 绝对容差。数在 `voice_parity::tolerance::MEL_TOLERANCE` 定义（全仓容差口径
+/// 只有那一处），050 的 128×50 对照给它留了两倍多余量，062 实测差 6.866455e-5。
+const MEL_ABS_TOLERANCE: f32 = MEL_TOLERANCE;
 
 fn reference() -> Reference {
     Reference::load().unwrap_or_else(|error| {
@@ -52,10 +56,21 @@ fn mel_matches_reference() {
 
     let frontend = MelFrontend::new();
     let actual = frontend.log_mel(&pcm);
-    let report = reference.compare("mel", &actual, MEL_TOLERANCE);
+    let report = reference.compare("mel", &actual, MEL_ABS_TOLERANCE);
 
     println!("{report}");
     println!("实测最大绝对差：{:?}", report.max_abs_diff);
+    if let Some(diff) = report.max_abs_diff {
+        // 梅尔不走 f16 折算（见 tolerance 模块头），余量只是容差除以实测差。
+        let room = if diff == 0.0 {
+            "无穷（差为 0）".to_string()
+        } else {
+            format!("{:.2} 倍", MEL_ABS_TOLERANCE / diff)
+        };
+        println!(
+            "梅尔：实测差 {diff:e}，容差 {MEL_ABS_TOLERANCE:e}，余量 {room}"
+        );
+    }
 
     assert_eq!(
         report.length_delta, 0,
@@ -64,7 +79,7 @@ fn mel_matches_reference() {
     );
     assert!(
         report.within_tolerance(),
-        "梅尔超出容差 {MEL_TOLERANCE:e}：\n{report}"
+        "梅尔超出容差 {MEL_ABS_TOLERANCE:e}：\n{report}"
     );
 }
 

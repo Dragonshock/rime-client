@@ -87,9 +87,14 @@ struct AudioLayer {
 
 impl AudioTower {
     /// 打开 `model_dir/weights.safetensors` 并读出音频塔的全部权重。
+    ///
+    /// 只给单独量音频塔的对照用；引擎线程上走 `Engine::open`，两座塔共用一个
+    /// 文件句柄与末尾一次 `eval`。
     pub fn open(model_dir: &str, dtype: DType) -> Result<Self, MlxError> {
         let mut weights = SafeWeights::open(model_dir)?;
-        Self::load(&mut weights, dtype)
+        let tower = Self::load(&mut weights, dtype)?;
+        weights.finish()?;
+        Ok(tower)
     }
 
     /// 按 `audio_tower.*` 的键名把权重读进来，统一转成 `dtype`。

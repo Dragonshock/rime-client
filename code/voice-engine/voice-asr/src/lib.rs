@@ -207,6 +207,28 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_partial_step_does_not_retract_the_published_text() {
+        // 说话中的一步可以没有新文本（例如松开之后跳过的那一步）。空串不下发，
+        // 已经写出去的预编辑留着，由定稿决定清不清。
+        let fake = Fake {
+            partial: "",
+            final_text: "乙",
+            calls: Vec::new(),
+            empty_written: false,
+            saw_hotword: false,
+            last_active_frames: 0,
+            last_committed: 0,
+        };
+        let mut session = session(None, fake);
+        session.feed(&vec![1i16; STEP_SAMPLES]).expect("两秒");
+        assert!(session.sink().is_empty(), "空的部分结果不下发");
+        session.finish().expect("定稿");
+        assert_eq!(session.sink().len(), 1);
+        assert!(session.sink()[0].is_final);
+        assert_eq!(session.sink()[0].text, "乙");
+    }
+
+    #[test]
     fn eight_seconds_commits_one_encoder_window() {
         let fake = Fake {
             partial: "窗",

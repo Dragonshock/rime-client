@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::panic::{self, AssertUnwindSafe};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -134,21 +135,31 @@ pub(crate) struct Worker {
     join: Mutex<Option<JoinHandle<()>>>,
     sinks: Arc<Mutex<Sinks>>,
     last_error: Arc<Mutex<Option<String>>>,
+    /// 松开之后不再跑说话中的部分步：那一步的结果定稿会整段重算一遍。
+    finishing: Arc<AtomicBool>,
 }
 
 impl Worker {
     /// 启动引擎线程。模型目录必须已经能打开。
     ///
-    /// 打开 `metal` 时，权重与梅尔前端在引擎线程起来的时候打开一次，之后的会话
-    /// 只借用同一份实例。
+    /// 打开 `metal` 时引擎线程起来只装第一段（梅尔前端与音频塔），之后的会话
+    /// 只借用同一份实例；文本塔在第一次 `begin` 之后的那一步装上（见
+    /// `drive` 里的 `Begin`）。
     pub(crate) fn start(model_dir: String, metallib: Option<String>) -> std::io::Result<Self> {
+        let finishing = Arc::new(AtomicBool::new(false));
         #[cfg(feature = "metal")]
         {
-            return Self::spawn(model_dir, metallib, crate::decoder::WeightDecoder::new);
+            let flag = Arc::clone(&finishing);
+            return Self::spawn(
+                model_dir,
+                metallib,
+                finishing,
+                move |_| crate::decoder::WeightDecoder::new(Arc::clone(&flag)),
+            );
         }
         #[cfg(not(feature = "metal"))]
         {
-            Self::spawn(model_dir, metallib, || UnlinkedDecoder)
+            Self::spawn(model_dir, metallib, finishing, |_| UnlinkedDecoder)
         }
     }
 
@@ -156,17 +167,19 @@ impl Worker {
     pub(crate) fn spawn<H, F>(
         model_dir: String,
         metallib: Option<String>,
+        finishing: Arc<AtomicBool>,
         factory: F,
     ) -> std::io::Result<Self>
     where
         H: DecodeText + 'static,
-        F: FnMut() -> H + Send + 'static,
+        F: FnMut(&Arc<AtomicBool>) -> H + Send + 'static,
     {
         let (tx, rx) = mpsc::sync_channel(PCM_QUEUE_BOUND);
         let sinks = Arc::new(Mutex::new(Sinks::default()));
         let last_error = Arc::new(Mutex::new(None));
         let shared_sinks = Arc::clone(&sinks);
         let shared_error = Arc::clone(&last_error);
+        let shared_finishing = Arc::clone(&finishing);
         let (ready_tx, ready_rx) = mpsc::channel();
         let join = thread::Builder::new()
             .name("voice-engine".to_string())
@@ -178,7 +191,7 @@ impl Worker {
                 if !ready {
                     return;
                 }
-                thread_main(rx, shared_sinks, shared_error, factory);
+                thread_main(rx, shared_sinks, shared_error, shared_finishing, factory);
             })?;
         match ready_rx.recv() {
             Ok(true) => Ok(Self {
@@ -186,6 +199,7 @@ impl Worker {
                 join: Mutex::new(Some(join)),
                 sinks,
                 last_error,
+                finishing,
             }),
             _ => {
                 let _ = join.join();
@@ -234,7 +248,11 @@ impl Worker {
     }
 
     /// 等到引擎线程调用 `voice-asr` 的 `finish`。0 表示已接受。
+    ///
+    /// 排在前面的 `Feed` 还没处理完时，引擎线程会先看见这一位，跳过说话中的
+    /// 部分步：那一步的结果定稿会整段重算，跑了也是白跑，只会拖后定稿。
     pub(crate) fn finish(&self, session: u64) -> i32 {
+        self.finishing.store(true, Ordering::SeqCst);
         let (reply_tx, reply_rx) = mpsc::channel();
         if self
             .tx
@@ -244,9 +262,16 @@ impl Worker {
             })
             .is_err()
         {
+            self.finishing.store(false, Ordering::SeqCst);
             return -1;
         }
         reply_rx.recv().unwrap_or(-1)
+    }
+
+    /// 测试用：`finishing` 位现在是什么。
+    #[cfg(test)]
+    pub(crate) fn flag_value_for_test(&self) -> bool {
+        self.finishing.load(Ordering::SeqCst)
     }
 
     pub(crate) fn shutdown(&self) {
@@ -267,10 +292,11 @@ fn thread_main<H, F>(
     rx: Receiver<Command>,
     sinks: Arc<Mutex<Sinks>>,
     last_error: Arc<Mutex<Option<String>>>,
+    finishing: Arc<AtomicBool>,
     mut factory: F,
 ) where
     H: DecodeText,
-    F: FnMut() -> H,
+    F: FnMut(&Arc<AtomicBool>) -> H,
 {
     let mut sessions: HashMap<u64, Session<Active, H, SessionSink>> = HashMap::new();
     loop {
@@ -283,9 +309,10 @@ fn thread_main<H, F>(
         }
         let sinks = &sinks;
         let last_error = &last_error;
+        let finishing = &finishing;
         let factory = &mut factory;
         let _ = panic::catch_unwind(AssertUnwindSafe(|| {
-            drive(&mut sessions, command, sinks, last_error, factory);
+            drive(&mut sessions, command, sinks, last_error, finishing, factory);
         }));
     }
 }
@@ -296,10 +323,11 @@ fn drive<H, F>(
     command: Command,
     sinks: &Arc<Mutex<Sinks>>,
     last_error: &Arc<Mutex<Option<String>>>,
+    finishing: &Arc<AtomicBool>,
     factory: &mut F,
 ) where
     H: DecodeText,
-    F: FnMut() -> H,
+    F: FnMut(&Arc<AtomicBool>) -> H,
 {
     match command {
         Command::Begin {
@@ -319,10 +347,14 @@ fn drive<H, F>(
                 let _ = reply.send(-1);
                 return;
             };
-            match Session::new(hotwords.as_deref(), ops, factory(), sink) {
+            match Session::new(hotwords.as_deref(), ops, factory(finishing), sink) {
                 Ok(created) => {
                     sessions.insert(session, created);
                     let _ = reply.send(0);
+                    // 第二段在这里装：回已经发出去了，调用线程不等这一段。读盘与上传
+                    // （文本塔 335 MB、704 张张量）跟用户说话重叠，音频排在有界队列里。
+                    // 装不上不在这里收场：`finish` 那次会再叫一次，并在真装不上时报原因。
+                    let _ = crate::backend::load_text_deferred();
                 }
                 Err(_) => {
                     let _ = reply.send(-1);
@@ -335,14 +367,21 @@ fn drive<H, F>(
             }
         }
         Command::Finish { session, reply } => {
+            finishing.store(false, Ordering::SeqCst);
             let Some(mut slot) = sessions.remove(&session) else {
                 *lock(last_error) = Some("这个会话不在引擎线程上".to_string());
                 let _ = reply.send(-1);
                 return;
             };
-            let reason = match slot.finish() {
-                Ok(()) => slot.decoder().failure_reason(),
-                Err(error) => Some(format!("定稿步失败：{error}")),
+            // 极短语音：`begin` 之后马上松手，文本塔那一步可能还没跑完（或没跑成）。
+            // 这里等它装完再定稿——定稿不会因为「文本塔还没好」而给空串。
+            let staged = crate::backend::load_text_deferred();
+            let reason = match staged {
+                Err(error) => Some(format!("文本塔装载失败：{error}")),
+                Ok(_) => match slot.finish() {
+                    Ok(()) => slot.decoder().failure_reason(),
+                    Err(error) => Some(format!("定稿步失败：{error}")),
+                },
             };
             if let Some(reason) = &reason {
                 emit_failure(sinks, session, reason);

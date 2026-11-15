@@ -31,22 +31,22 @@ use std::path::PathBuf;
 use voice_mlx::{
     encode_mel, encode_mel_with, AudioTower, EncoderOptions, MlxBackend, PositionDenominator,
 };
-use voice_parity::{asset_root, Reference};
+use voice_parity::{
+    asset_root,
+    tolerance::{
+        Margin, CONV_STEM_UNITS, ENCODER_LAYER0_UNITS, ENCODER_PROJ_UNITS,
+    },
+    Reference,
+};
 use voice_tensor::DType;
 
-/// 16 位浮点在 1.0 附近的单位舍入：`2^-11 ≈ 4.88e-4`。
-///
-/// 容差一律写成「参考张量的绝对值上界 × 这个单位 × 乘数」，不写拍脑袋的绝对数。
-/// 依据见 053：参考的激活、权重、卷积与归一化输出全是 f16，一次存储最多差
-/// 半个单位；层数越多、求和越长，累积的单位数越多。
-const F16_UNIT: f32 = 1.0 / 2048.0;
-/// 卷积茎：三层卷积 + 三次 GELU 的 f16 存储，实测 0，给 4 个单位。
-const STEM_UNITS: f32 = 4.0;
-/// 第 0 层：一次双向注意力 + 两层前馈，实测 1 个单位，给 4 个单位。
-const LAYER0_UNITS: f32 = 4.0;
-/// 末尾投影：18 层全走完，每层都往隐层里叠一次 f16 舍入，
-/// 实测约 10 个单位（按本张量的绝对值上界折算），给 32 个单位。
-const PROJ_UNITS: f32 = 32.0;
+// 容差口径只在 `voice_parity::tolerance` 定义一处：
+//
+//   容差 = 参考张量的绝对值上界 × 2^-11 × 允许的单位数
+//
+// 参考是 f16，`2^-11` 是「元素按自身量级折算的半个 f16 间距」的上界；单位数每闸
+// 各一个常量，取多少与实测多少都写在 `voice_parity::tolerance` 的注释里。
+// 这里不再写任何绝对容差。
 
 fn metallib() -> PathBuf {
     if let Some(path) = std::env::var_os("VOICE_METALLIB") {
@@ -134,46 +134,60 @@ fn encoder_matches_reference() {
     let layer0 = reference.tensor("encoder_layer0_out").expect("存在");
     let proj = reference.tensor("encoder_proj_out").expect("存在");
 
-    let stem_tol = abs_max(&stem.values) * F16_UNIT * STEM_UNITS;
-    let layer0_tol = abs_max(&layer0.values) * F16_UNIT * LAYER0_UNITS;
-    let proj_tol = abs_max(&proj.values) * F16_UNIT * PROJ_UNITS;
-
-    let stem_report = reference.compare("conv_stem_out", &out.stem_chunk0, stem_tol);
-    let layer0_report = reference.compare("encoder_layer0_out", &out.layer0, layer0_tol);
-    let proj_report = reference.compare("encoder_proj_out", &out.proj, proj_tol);
-
-    println!("参考绝对值上界与容差：");
-    println!(
-        "  conv_stem_out      上界 {:e}，容差 {:e}",
+    let stem_tol = Margin::new(
         abs_max(&stem.values),
-        stem_tol
+        CONV_STEM_UNITS,
+        worst(&out.stem_chunk0, &stem.values),
     );
-    println!(
-        "  encoder_layer0_out 上界 {:e}，容差 {:e}",
+    let layer0_tol = Margin::new(
         abs_max(&layer0.values),
-        layer0_tol
+        ENCODER_LAYER0_UNITS,
+        worst(&out.layer0, &layer0.values),
     );
-    println!(
-        "  encoder_proj_out   上界 {:e}，容差 {:e}",
+    let proj_tol = Margin::new(
         abs_max(&proj.values),
-        proj_tol
+        ENCODER_PROJ_UNITS,
+        worst(&out.proj, &proj.values),
     );
+
+    let stem_report = reference.compare("conv_stem_out", &out.stem_chunk0, stem_tol.tolerance());
+    let layer0_report =
+        reference.compare("encoder_layer0_out", &out.layer0, layer0_tol.tolerance());
+    let proj_report = reference.compare("encoder_proj_out", &out.proj, proj_tol.tolerance());
+
+    println!("参考绝对值上界、容差与余量（口径：上界 × 2^-11 × 单位数）：");
+    for (name, margin) in [
+        ("conv_stem_out", stem_tol),
+        ("encoder_layer0_out", layer0_tol),
+        ("encoder_proj_out", proj_tol),
+    ] {
+        println!("  {name:19} 上界 {:e}，{margin}", margin.reference_abs_max);
+    }
     println!("{stem_report}");
     println!("{layer0_report}");
     println!("{proj_report}");
 
     assert!(
         stem_report.within_tolerance(),
-        "卷积茎超出容差 {stem_tol:e}：\n{stem_report}"
+        "卷积茎超出容差 {:e}：\n{stem_report}",
+        stem_tol.tolerance()
     );
     assert!(
         layer0_report.within_tolerance(),
-        "第 0 层超出容差 {layer0_tol:e}：\n{layer0_report}"
+        "第 0 层超出容差 {:e}：\n{layer0_report}",
+        layer0_tol.tolerance()
     );
     assert!(
         proj_report.within_tolerance(),
-        "末尾投影超出容差 {proj_tol:e}：\n{proj_report}"
+        "末尾投影超出容差 {:e}：\n{proj_report}",
+        proj_tol.tolerance()
     );
+    // 余量记在报告里：差值与容差各自通过 `compare` 算过一遍，这里要求两边同源，
+    // 免得打印的数与断言的数走两个口径。
+    assert_eq!(stem_report.max_abs_diff, Some(stem_tol.diff));
+    assert_eq!(layer0_report.max_abs_diff, Some(layer0_tol.diff));
+    assert_eq!(proj_report.max_abs_diff, Some(proj_tol.diff));
+    assert!(stem_tol.within() && layer0_tol.within() && proj_tol.within());
 }
 
 /// 权重来源本身：`audio_tower.*` 的分组权重、卷积与 LayerNorm 都能读出来。

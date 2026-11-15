@@ -1,6 +1,7 @@
 //! 只在 `metal` 特性下编译。运算走 `mlx-rs` 0.34 的 GPU stream。
 
 mod audio_tower;
+mod stream;
 mod text_decoder;
 mod transcribe;
 mod weights;
@@ -8,13 +9,14 @@ mod weights;
 pub use audio_tower::{
     encode_mel, encode_mel_with, AudioTower, EncoderOptions, EncoderOutput, PositionDenominator,
 };
+pub use stream::{Stream, StreamOpened, StreamStep};
 pub use text_decoder::{
     DecoderOptions, Generation, PrefillLogits, QuantPolicy, RopeMode, StopReason, TextDecoder, EOS,
     IM_END, LM_HEAD_BLOCK, MAX_NEW_TOKENS,
 };
 pub use transcribe::{
-    build_prompt, prompt_tokens, transcribe, transcribe_with, transcribe_with_opened, Engine,
-    Opened, Transcription, PROMPT_LANGUAGE,
+    build_prompt, prompt_parts, prompt_tokens, splice_prompt, transcribe, transcribe_with,
+    transcribe_with_opened, Engine, Opened, PromptParts, Transcription, PROMPT_LANGUAGE,
 };
 
 use std::cell::RefCell;
@@ -22,14 +24,14 @@ use std::fmt;
 
 use mlx_rs::ops::indexing::take_axis;
 use mlx_rs::ops::{DequantizeOptions, QuantizationMode, QuantizedMatmulOptions};
-use mlx_rs::{fast, ops, random, with_stream, Array, Device, Dtype, Stream};
+use mlx_rs::{fast, ops, random, with_stream, Array, Device, Dtype, Stream as MlxStream};
 use voice_tensor::{
     AxisSlice, Conv2d, DType, KvCache, LayerNorm, Linear, PadWidth, RmsNorm, Storage, TensorMeta,
     TensorOps,
 };
 
 thread_local! {
-    static GPU: RefCell<Option<Stream>> = RefCell::new(None);
+    static GPU: RefCell<Option<MlxStream>> = RefCell::new(None);
 }
 
 /// MLX 调用失败。
@@ -122,7 +124,7 @@ impl TensorMeta for MlxTensor {
 
 /// 这根线程的 GPU stream。由 [`MlxBackend::prepare`] 创建。
 pub struct MlxBackend {
-    stream: Stream,
+    stream: MlxStream,
 }
 
 impl MlxBackend {
@@ -133,7 +135,7 @@ impl MlxBackend {
         }
         mlx_rs::metal::set_metallib_path(metallib).map_err(from_mlx)?;
         let device = Device::gpu();
-        let stream = Stream::new_with_device(&device);
+        let stream = MlxStream::new_with_device(&device);
         with_stream(&stream, || {
             let probe = ops::zeros::<f32>(&[1]).map_err(from_mlx)?;
             probe.eval().map_err(from_mlx)?;

@@ -13,8 +13,14 @@
 //!
 //! 资产位置默认 `../../voice-oracle/assets`（相对本箱子），可用环境变量
 //! `VOICE_ORACLE_ASSETS` 指向别处。
+//!
+//! 数值闸的容差口径（参考是 f16，容差 = 上界 × 2^-11 × 倍数）只在
+//! [`tolerance`] 里写一次，编码器、解码器与梅尔三条闸都引用那里。
 
 mod json;
+pub mod tolerance;
+
+pub use tolerance::{f16_tolerance, f16_units, Margin, F16_UNIT};
 
 use std::collections::BTreeMap;
 use std::fmt;

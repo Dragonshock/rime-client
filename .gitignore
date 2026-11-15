@@ -19,3 +19,10 @@ code/voice-engine/target/
 # 参考克隆各有自己的 .git，按目录整体排除，避免被当成内嵌仓库。
 dev-docs/refs/code/
 *.tmp
+
+# 封装的中间目录不进仓库；归档与哈希要进，方便直接下载。
+/dist/RimeClient-*/
+/dist/*.tar.zst
+/dist/*.sha256
+!/dist/RimeClient-*.tar.zst
+!/dist/RimeClient-*.sha256

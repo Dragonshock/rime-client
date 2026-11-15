@@ -8,7 +8,8 @@
 一共导出六项：
 
     mel                      (128, n_frames)   对数梅尔谱（参考 f32 值）
-    conv_stem_out            (16, 13, 480)     卷积茎对第 0 个 100 帧块的输出（NHWC）
+    conv_stem_out            (16, 13, 480)     卷积茎对第 0 个 100 帧块的输出（NHWC）；
+                                               多块模式下为 (整块数, 16, 13, 480)
     encoder_layer0_out       (1, n_tokens, 896) 第 0 层编码器的残差输出
     encoder_proj_out         (n_tokens, 1024)  编码器末尾 ln_post/gelu/proj1/proj2
     prefill_logits_64        (64,)             预填充最后一个位置的前 64 维 logits
@@ -22,10 +23,14 @@
     code/voice-worker/.venv/bin/python code/voice-oracle/dump_reference.py
     code/voice-worker/.venv/bin/python code/voice-oracle/dump_reference.py --wav /tmp/a.wav
     code/voice-worker/.venv/bin/python code/voice-oracle/dump_reference.py --pcm /tmp/a.bin --out /tmp/ref
+    code/voice-worker/.venv/bin/python code/voice-oracle/dump_reference.py --multichunk
 
 不带参数时用内置确定性探针（16 kHz 单声道 i16，32000 采样，公式
 `sample = (i * 37) % 2001 - 1000`）。带 `--wav`/`--pcm` 时对给定音频导出同一组量，
 资产与 manifest 写到 `--out` 指定目录（默认仍是 assets 目录）。
+`--multichunk` 对 `assets/zh` 下的 `s1_3.0.pcm`、`s1_4.0.pcm` 各导一套（3 / 4 个整块），
+每段写到 `assets/multichunk/<段名>/`，并在 `assets/multichunk/manifest.json` 写汇总；
+这条路径不碰 assets 根下的 200 帧资产，且卷积茎落整批（第 0 维是块号）。
 """
 
 from __future__ import annotations
@@ -44,6 +49,9 @@ PROBE_SAMPLES = 32000
 PROBE_FORMULA = "sample = (i * 37) % 2001 - 1000"
 
 ASSETS_DIR = Path(__file__).resolve().parent / "assets"
+# 多块资产：`assets/zh` 下的真实中文语音；3.0 s / 4.0 s 是恰好 3 / 4 个整块。
+SEGMENTS_DIR = ASSETS_DIR / "zh"
+MULTICHUNK_SEGMENTS = ("s1_3.0", "s1_4.0")
 DEFAULT_MODEL_GLOB = (
     "~/.cache/huggingface/hub/models--moona3k--mlx-qwen3-asr-0.6b-4bit/snapshots/*"
 )
@@ -172,8 +180,11 @@ def capture_forward(model, config, mel, feature_lens, dtype):
 
         def patched_stem(x):
             out = original_stem(x)
-            # `x` 形状 (n_chunks, 128, 100, 1)，按块批处理；这里只留第 0 块。
-            captured.setdefault("conv_stem_out_raw", (np.array(out[0]), tuple(out.shape)))
+            # `x` 形状 (n_chunks, 128, 100, 1)，按块批处理；每次调用都留一份，
+            # 尾块会走第二次调用（宽度不足一块），形状与整块那次不同。
+            captured.setdefault("conv_stem_calls", []).append(  # type: ignore[union-attr]
+                (np.array(out), tuple(out.shape))
+            )
             return out
 
         tower._apply_conv_stem = patched_stem  # type: ignore[method-assign]
@@ -204,10 +215,12 @@ def capture_forward(model, config, mel, feature_lens, dtype):
         if original_stem is not None:
             tower._apply_conv_stem = original_stem  # type: ignore[method-assign]
 
-    stem_entry = captured.get("conv_stem_out_raw")
+    stem_calls = captured.get("conv_stem_calls") or []
     stem_chunk0 = None
+    stem_all_chunks = None
     stem_full_shape = None
-    if stem_entry is None:
+    stem_call_shapes: list[list[int]] = []
+    if not stem_calls:
         failures.append(
             {
                 "key": "conv_stem_out",
@@ -215,7 +228,11 @@ def capture_forward(model, config, mel, feature_lens, dtype):
             }
         )
     else:
-        stem_chunk0, stem_full_shape = stem_entry  # type: ignore[misc]
+        first_out, first_shape = stem_calls[0]
+        stem_chunk0 = first_out[0]
+        stem_all_chunks = first_out
+        stem_full_shape = tuple(first_shape)
+        stem_call_shapes = [list(shape) for _, shape in stem_calls]
     layer0_out = captured.get("encoder_layer0_out_raw")
     if layer0_out is None:
         failures.append(
@@ -230,7 +247,11 @@ def capture_forward(model, config, mel, feature_lens, dtype):
         "output_lens": output_lens,
         "total_tokens": int(audio_features.shape[-2]),
         "conv_stem_out": None if stem_chunk0 is None else np.asarray(stem_chunk0, dtype=np.float32),
+        "conv_stem_all_chunks": (
+            None if stem_all_chunks is None else np.asarray(stem_all_chunks, dtype=np.float32)
+        ),
         "conv_stem_full_shape": None if stem_full_shape is None else list(stem_full_shape),
+        "conv_stem_call_shapes": stem_call_shapes,
         "encoder_layer0_out": None if layer0_out is None else np.asarray(layer0_out, dtype=np.float32),
         "failures": failures,
     }
@@ -303,12 +324,21 @@ def reference_generate_tokens(model, input_ids, audio_features, position_ids, co
 
 
 def dump(audio_pcm: np.ndarray, audio_source: str, out_dir: Path, model_dir: Path,
-         dtype_name: str, language: str | None, context: str) -> dict:
-    """导出六项参考量、写资产与 manifest，返回 manifest 字典。"""
+         dtype_name: str, language: str | None, context: str,
+         stem_all_chunks: bool = False, runtime=None) -> dict:
+    """导出六项参考量、写资产与 manifest，返回 manifest 字典。
+
+    `stem_all_chunks` 为真时卷积茎落盘成整批（第 0 维是块号），用于多块音频；
+    为假时与旧资产一致，只落第 0 块 `(16, 13, 480)`。`runtime` 可传入已加载的
+    `(model, config, tokenizer, dtype)`，多段连续导出时免去重复加载。
+    """
     import mlx.core as mx
     from mlx_qwen3_asr.audio import compute_features
 
-    model, config, tokenizer, dtype = load_reference(model_dir, dtype_name)
+    if runtime is None:
+        model, config, tokenizer, dtype = load_reference(model_dir, dtype_name)
+    else:
+        model, config, tokenizer, dtype = runtime
 
     audio = pcm_to_float(audio_pcm)
     mel, feature_lens = compute_features(audio, SAMPLE_RATE)
@@ -374,17 +404,35 @@ def dump(audio_pcm: np.ndarray, audio_source: str, out_dir: Path, model_dir: Pat
         "参考以 f32 计算后转模型 dtype 送进编码器；这里存转换前的 f32 值",
     )
     if forward["conv_stem_out"] is not None:
-        emit(
-            "conv_stem_out",
-            forward["conv_stem_out"],
-            "mlx_qwen3_asr.encoder.AudioEncoder._apply_conv_stem",
-            "存的是前向里第一次 _apply_conv_stem 调用的第 0 块，布局为参考的 NHWC "
-            "(频域 16, 时域 13, 480 通道)；送进 conv_out 前参考会 transpose 成 (13, 480*16)",
-            extra={
-                "captured_from": "首次 _apply_conv_stem 调用的输出[0]",
-                "full_call_output_shape": forward["conv_stem_full_shape"],
-            },
-        )
+        if stem_all_chunks and forward.get("conv_stem_all_chunks") is not None:
+            emit(
+                "conv_stem_out",
+                forward["conv_stem_all_chunks"],
+                "mlx_qwen3_asr.encoder.AudioEncoder._apply_conv_stem",
+                "存的是前向里第一次 _apply_conv_stem 调用的整批输出，第 0 维是整块号"
+                "（每块 100 梅尔帧），布局为参考的 NHWC (块, 频域 16, 时域 13, 480)；"
+                "送进 conv_out 前参考会按块 transpose 成 (13, 480*16) 再拼起来。"
+                "取本张量的 [0] 就是旧 200 帧资产里的 (16, 13, 480)",
+                extra={
+                    "captured_from": "首次 _apply_conv_stem 调用的完整输出",
+                    "full_call_output_shape": forward["conv_stem_full_shape"],
+                    "all_stem_call_shapes": forward["conv_stem_call_shapes"],
+                    "chunks_in_first_call": forward["conv_stem_full_shape"][0],
+                },
+            )
+        else:
+            emit(
+                "conv_stem_out",
+                forward["conv_stem_out"],
+                "mlx_qwen3_asr.encoder.AudioEncoder._apply_conv_stem",
+                "存的是前向里第一次 _apply_conv_stem 调用的第 0 块，布局为参考的 NHWC "
+                "(频域 16, 时域 13, 480 通道)；送进 conv_out 前参考会 transpose 成 (13, 480*16)",
+                extra={
+                    "captured_from": "首次 _apply_conv_stem 调用的输出[0]",
+                    "full_call_output_shape": forward["conv_stem_full_shape"],
+                    "all_stem_call_shapes": forward["conv_stem_call_shapes"],
+                },
+            )
     if forward["encoder_layer0_out"] is not None:
         layer0_out = forward["encoder_layer0_out"]
         covers_all = int(layer0_out.shape[1]) == forward["total_tokens"]
@@ -433,6 +481,7 @@ def dump(audio_pcm: np.ndarray, audio_source: str, out_dir: Path, model_dir: Pat
         "model_dtype": dtype_name,
         "activation_dtype": str(dtype),
         "sample_rate": SAMPLE_RATE,
+        "conv_stem_layout": "all_chunks" if stem_all_chunks else "chunk0_only",
         "audio_input": {
             "source": audio_source,
             "file": probe_pcm_path.name,
@@ -473,6 +522,73 @@ def dump(audio_pcm: np.ndarray, audio_source: str, out_dir: Path, model_dir: Pat
     return manifest
 
 
+def dump_segments(segment_names: list[str], segments_dir: Path, out_dir: Path,
+                 model_dir: Path, dtype_name: str, language: str | None,
+                 context: str) -> dict:
+    """对多段音频各导出一套参考量，并在 `out_dir` 写一份汇总 manifest。
+
+    每段落到 `out_dir/<段名>/`，自己带一份扁平 manifest；汇总 manifest 把两段的
+    熵（key、形状、dtype、来源函数）与音频 token 数收到一起。模型只加载一次。
+    卷积茎在这些段上落整批（第 0 维是块号），因为多块差异正是要看的东西。
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    runtime = load_reference(model_dir, dtype_name)
+
+    segments: list[dict] = []
+    unavailable: list[dict] = []
+    audio_tokens: dict[str, int] = {}
+    for name in segment_names:
+        pcm_path = segments_dir / f"{name}.pcm"
+        if not pcm_path.exists():
+            raise SystemExit(f"找不到音频 {pcm_path}")
+        pcm = read_raw_pcm(pcm_path)
+        manifest = dump(
+            audio_pcm=pcm,
+            audio_source=f"pcm:{pcm_path}",
+            out_dir=out_dir / name,
+            model_dir=model_dir,
+            dtype_name=dtype_name,
+            language=language,
+            context=context,
+            stem_all_chunks=True,
+            runtime=runtime,
+        )
+        n_tokens = int(manifest["audio_frames"]["n_audio_tokens"])
+        audio_tokens[name] = n_tokens
+        segments.append(
+            {
+                "segment": name,
+                "dir": name,
+                "manifest": f"{name}/manifest.json",
+                "audio": manifest["audio_input"],
+                "audio_frames": manifest["audio_frames"],
+                "greedy": manifest["greedy"],
+                "tensors": [
+                    {**entry, "file": f"{name}/{entry['file']}"}
+                    for entry in manifest["tensors"]
+                ],
+            }
+        )
+        unavailable.extend({"segment": name, **entry} for entry in manifest["unavailable"])
+
+    index = {
+        "generated_by": "code/voice-oracle/dump_reference.py --multichunk",
+        "reference_package": "mlx_qwen3_asr 0.4.4（code/voice-worker/.venv，只作对照）",
+        "purpose": "多个整块的音频上的逐层参考量；旧的 200 样点探针资产未动",
+        "model_dir": str(model_dir),
+        "model_dtype": dtype_name,
+        "sample_rate": SAMPLE_RATE,
+        "chunk_frames": 100,
+        "audio_tokens": audio_tokens,
+        "segments": segments,
+        "unavailable": unavailable,
+    }
+    (out_dir / "manifest.json").write_text(
+        json.dumps(index, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    return index
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         description="导出 mlx_qwen3_asr 的逐层参考量（只作对照，不进产品路径）"
@@ -491,7 +607,55 @@ def main(argv: list[str]) -> int:
         help='给提示尾部强制语言，传 "none" 表示不写（默认 Chinese，与 voice-worker 一致）',
     )
     parser.add_argument("--context", default="", help="系统提示里的上下文串，默认空")
+    parser.add_argument(
+        "--multichunk", action="store_true",
+        help="对多段音频（默认 s1_3.0、s1_4.0）各导出一套量；默认为 assets/multichunk",
+    )
+    parser.add_argument(
+        "--segments", default=",".join(MULTICHUNK_SEGMENTS),
+        help="--multichunk 要导的段名，逗号分隔，相对 --segments-dir",
+    )
+    parser.add_argument(
+        "--segments-dir", default=str(SEGMENTS_DIR),
+        help="--multichunk 的音频目录，默认 code/voice-oracle/assets/zh",
+    )
     args = parser.parse_args(argv)
+
+    language = None if args.language.strip().lower() in {"", "none", "null"} else args.language
+    model_dir = resolve_model_dir(args.model)
+
+    if args.multichunk:
+        if args.wav or args.pcm:
+            raise SystemExit("--multichunk 不接受 --wav/--pcm，请用 --segments/--segments-dir")
+        names = [item.strip() for item in args.segments.split(",") if item.strip()]
+        if not names:
+            raise SystemExit("--segments 为空")
+        out_dir = Path(args.out).expanduser() if args.out else ASSETS_DIR / "multichunk"
+        index = dump_segments(
+            names,
+            Path(args.segments_dir).expanduser(),
+            out_dir,
+            model_dir,
+            args.dtype,
+            language,
+            args.context,
+        )
+        print(f"资产目录 {out_dir}（模型 {model_dir}）")
+        for entry in index["segments"]:
+            frames = entry["audio_frames"]
+            samples = entry["audio"]["shape"][0]
+            print(
+                f"  {entry['segment']:<10} {samples:>6} 采样 / {samples / SAMPLE_RATE:.3f} s "
+                f"梅尔 {frames['mel_frames']:>3} 帧 → 音频 token {frames['n_audio_tokens']:>3}"
+            )
+            for tensor in entry["tensors"]:
+                print(f"      {tensor['key']:<20} {tuple(tensor['shape'])!s:<20} {tensor['file']}")
+            print(f"      贪心前 {GREEDY_TOKENS} 个 token：{entry['greedy']['tokens']}")
+        for entry in index["unavailable"]:
+            print(f"  unavailable {entry['segment']}/{entry['key']}：{entry['reason']}")
+        tokens = index["audio_tokens"]
+        print("音频 token 数：" + "，".join(f"{k} = {v}" for k, v in tokens.items()))
+        return 0
 
     if args.wav:
         pcm = read_wav_pcm(Path(args.wav).expanduser())
@@ -503,9 +667,7 @@ def main(argv: list[str]) -> int:
         pcm = build_probe_pcm()
         audio_source = "probe"
 
-    language = None if args.language.strip().lower() in {"", "none", "null"} else args.language
     out_dir = Path(args.out).expanduser() if args.out else ASSETS_DIR
-    model_dir = resolve_model_dir(args.model)
 
     manifest = dump(
         audio_pcm=pcm,

@@ -176,6 +176,8 @@ where
     }
 
     /// 松开。没有样本时回调空串，且 `is_final` 为真。有样本时不再等待 2 秒。
+    ///
+    /// 部分步的空串不下发（见 `apply`），定稿的空串一定下发。
     pub fn finish(&mut self) -> Result<(), EngineError<B::Error>> {
         if self.finished {
             return Ok(());
@@ -281,6 +283,12 @@ where
     }
 
     fn apply(&mut self, output: StepOutput, is_final: bool) {
+        if !is_final && output.text.is_empty() {
+            // 部分步可以什么都不说。空串在这里表示「这一步没有新文本」，不是
+            // 「整段变空」：已经写出去的预编辑留着，定稿再决定清不清。
+            // 说话中每 2 秒回调一次的契约不变，只是一步的空结果不下发。
+            return;
+        }
         let keep = self.config.text.unfixed_tokens.min(output.tokens.len());
         self.state.tokens = output.tokens;
         let split = self.state.tokens.len() - keep;

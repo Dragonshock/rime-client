@@ -180,9 +180,23 @@ impl TextDecoder {
         policy: QuantPolicy,
     ) -> Result<Self, MlxError> {
         let mut weights = SafeWeights::open(model_dir)?;
+        let decoder = Self::load(&mut weights, dtype, policy)?;
+        weights.finish()?;
+        Ok(decoder)
+    }
+
+    /// 从已打开的权重里读出文本塔的全部张量。
+    ///
+    /// 分开是因为 `Engine::open` 把两座塔挂在同一份 `SafeWeights` 上：文件只开一次，
+    /// 求值也只在最后集中做一次。
+    pub(crate) fn load(
+        weights: &mut SafeWeights,
+        dtype: DType,
+        policy: QuantPolicy,
+    ) -> Result<Self, MlxError> {
         let mut layers = Vec::with_capacity(TEXT_LAYERS);
         for index in 0..TEXT_LAYERS {
-            layers.push(Layer::load(&mut weights, index, dtype, policy)?);
+            layers.push(Layer::load(weights, index, dtype, policy)?);
         }
         let norm_weight = weights.dense_as("model.norm.weight", dtype)?;
         let final_norm =
@@ -331,8 +345,104 @@ impl TextDecoder {
             options,
         )?;
         let last = self.final_norm(ops, &hidden, seq)?;
-        let (_, mut next, _) = self.head_logits(ops, &last, 1)?;
+        let (_, next, _) = self.head_logits(ops, &last, 1)?;
+        let (generation, _) = self.greedy(ops, &mut cache, seq, next, max_new_tokens, options)?;
+        Ok(generation)
+    }
 
+    /// 把一段提示接到已有键值缓存后面，返回最后一个位置的 logits。
+    ///
+    /// 缓存里已经有 `position` 个位置（`0..position`），这一段算出来接在后面，
+    /// 位置从 `position` 起数。加法遮罩按「绝对位置」拼：查询 `position + row`
+    /// 看得见 `0..=position + row`，与整段一次预填充是同一串数。
+    ///
+    /// 音频特征按这一段里 `<|audio_pad|>` 出现的顺序逐行注入，所以调用方只传
+    /// 「这一段自己用到的」那几行。返回的 `tokens` 是接完之后缓存里的位置数，
+    /// 不是这一段自己的长度。
+    #[allow(clippy::too_many_arguments)]
+    pub fn prefill_chunk(
+        &mut self,
+        ops: &mut MlxBackend,
+        cache: &mut [KvCache<MlxTensor>],
+        tokens: &[u32],
+        audio: &[f32],
+        position: usize,
+        head_dims: usize,
+        options: &DecoderOptions,
+    ) -> Result<PrefillLogits, MlxError> {
+        if tokens.is_empty() {
+            return Err(MlxError::new("这一段没有 token"));
+        }
+        if cache.len() != TEXT_LAYERS {
+            return Err(MlxError::new(format!(
+                "键值缓存 {} 层，应为 {TEXT_LAYERS} 层",
+                cache.len()
+            )));
+        }
+        let held = cache_positions(cache);
+        if held != position {
+            return Err(MlxError::new(format!(
+                "缓存里 {held} 个位置，与起点 {position} 对不上"
+            )));
+        }
+        let seq = tokens.len();
+        let hidden = self.embed_prompt(ops, tokens, audio)?;
+        let positions: Vec<f32> = (position..position + seq).map(|step| step as f32).collect();
+        let (cos, sin) = self.rope_tables_at(ops, &positions)?;
+        let mask = causal_mask_window(ops, seq, position + seq, position, self.dtype)?;
+        let hidden = self.run_layers(
+            ops,
+            &hidden,
+            &cos,
+            &sin,
+            Some(&mask),
+            Some(cache),
+            options,
+        )?;
+        let last = self.final_norm(ops, &hidden, seq)?;
+        let (head, argmax, argmax_value) = self.head_logits(ops, &last, head_dims)?;
+        Ok(PrefillLogits {
+            tokens: position + seq,
+            vocab: VOCAB_SIZE,
+            head,
+            argmax,
+            argmax_value,
+        })
+    }
+
+    /// 在一段已经预填充好的缓存上继续贪心。`base` 是缓存里现有的位置数（也就是
+    /// 提示长度），`next` 是预填充最后一位给出的 argmax。
+    ///
+    /// 返回值第二项是贪心写完之后缓存里的位置数：跨步复用要按它记账。
+    pub fn greedy_from_cache(
+        &self,
+        ops: &mut MlxBackend,
+        cache: &mut [KvCache<MlxTensor>],
+        base: usize,
+        next: usize,
+        max_new_tokens: usize,
+        options: &DecoderOptions,
+    ) -> Result<(Generation, usize), MlxError> {
+        let held = cache_positions(cache);
+        if held != base {
+            return Err(MlxError::new(format!(
+                "缓存里 {held} 个位置，与提示长度 {base} 对不上"
+            )));
+        }
+        self.greedy(ops, cache, base, next, max_new_tokens, options)
+    }
+
+    /// 贪心的那一段循环：从 `next` 起一个 token 一个 token 往后走，键值接在
+    /// `cache` 后面。`base` 是缓存里已有的位置数（第一个新 token 的位置就是它）。
+    fn greedy(
+        &self,
+        ops: &mut MlxBackend,
+        cache: &mut [KvCache<MlxTensor>],
+        base: usize,
+        mut next: usize,
+        max_new_tokens: usize,
+        options: &DecoderOptions,
+    ) -> Result<(Generation, usize), MlxError> {
         let mut tokens: Vec<u32> = Vec::with_capacity(max_new_tokens);
         let mut stopped_by = StopReason::MaxNewTokens;
         loop {
@@ -353,18 +463,23 @@ impl TextDecoder {
             if tokens.len() >= max_new_tokens {
                 break;
             }
-            let position = seq + tokens.len() - 1;
+            let position = base + tokens.len() - 1;
             let hidden = self.embed_token(ops, token)?;
             let (cos, sin) = self.rope_tables_at(ops, &[position as f32])?;
-            let hidden = self.run_layers(ops, &hidden, &cos, &sin, None, Some(&mut cache), options)?;
+            let hidden = self.run_layers(ops, &hidden, &cos, &sin, None, Some(cache), options)?;
             let last = self.final_norm(ops, &hidden, 1)?;
             next = self.head_logits(ops, &last, 1)?.1;
         }
-        Ok(Generation {
-            prompt_tokens: seq,
-            tokens,
-            stopped_by,
-        })
+        // 停止符不写进缓存：它是「这里结束」的记号，不是一个要往后算的位置。
+        let cached = base + tokens.len() - 1;
+        Ok((
+            Generation {
+                prompt_tokens: base,
+                tokens,
+                stopped_by,
+            },
+            cached,
+        ))
     }
 
     /// 从第 0 层跑到第 27 层。`cache` 给上时每层顺便写入键值。
@@ -787,13 +902,43 @@ fn merge_heads(
 
 /// 加法因果遮罩 `(1, 1, L, L)`：上三角 `-1e9`，其余 0，按激活 dtype 存。
 fn causal_mask(ops: &mut MlxBackend, seq: usize, dtype: DType) -> Result<MlxTensor, MlxError> {
-    let mut mask = vec![0.0f32; seq * seq];
-    for row in 0..seq {
-        for column in (row + 1)..seq {
-            mask[row * seq + column] = CAUSAL_MASK_FILL;
+    causal_mask_window(ops, seq, seq, 0, dtype)
+}
+
+/// 加法因果遮罩 `(1, 1, queries, keys)`，查询从绝对位置 `offset` 开始数。
+///
+/// 第 `row` 行（绝对位置 `offset + row`）看得见键 `0..=offset + row`，其余填
+/// `-1e9`（按 f16 存就是 `-inf`）。`offset = 0` 且 `keys = queries` 时与
+/// [`causal_mask`] 逐元素相同，所以分段预填充与整段预填充是同一串遮罩值。
+fn causal_mask_window(
+    ops: &mut MlxBackend,
+    queries: usize,
+    keys: usize,
+    offset: usize,
+    dtype: DType,
+) -> Result<MlxTensor, MlxError> {
+    if keys < offset + queries {
+        return Err(MlxError::new(format!(
+            "遮罩的键数 {keys} 比查询的最后一个位置 {} 还少",
+            offset + queries - 1
+        )));
+    }
+    let mut mask = vec![0.0f32; queries * keys];
+    for row in 0..queries {
+        for column in (offset + row + 1)..keys {
+            mask[row * keys + column] = CAUSAL_MASK_FILL;
         }
     }
-    ops.literal(&mask, &[1, 1, seq, seq], dtype)
+    ops.literal(&mask, &[1, 1, queries, keys], dtype)
+}
+
+/// 缓存里现有的位置数（序列轴是 `(B, H, T, D)` 的第 2 轴）。空缓存是 0。
+fn cache_positions(cache: &[KvCache<MlxTensor>]) -> usize {
+    cache
+        .first()
+        .and_then(|slot| slot.key())
+        .map(|key| key.dims()[2])
+        .unwrap_or(0)
 }
 
 #[cfg(test)]

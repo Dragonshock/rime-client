@@ -164,3 +164,58 @@ final class VoiceInputControllerTests: XCTestCase {
         XCTAssertFalse(source.contains("/usr/bin/python3"))
     }
 }
+
+final class VoiceWarmStartWiringTests: XCTestCase {
+    private func source(_ name: String) throws -> String {
+        var repo = VoiceClientLocation.workerScript
+        repo.deleteLastPathComponent()
+        repo.deleteLastPathComponent()
+        repo.deleteLastPathComponent()
+        let file = repo
+            .appendingPathComponent("code")
+            .appendingPathComponent("Client")
+            .appendingPathComponent("sources")
+            .appendingPathComponent(name)
+        return try String(contentsOf: file, encoding: .utf8)
+    }
+
+    /// 预热点在 IMKServer 之后、app.run() 之前，并且是后台队列（start 自己开队列）。
+    func testMainStartsWarmupAfterServerBeforeRun() throws {
+        let main = try source("Main.swift")
+        guard let server = main.range(of: "IMKServer(name: connectionName"),
+              let warmup = main.range(of: "VoiceEngineWarmup.shared.start(")
+        else {
+            XCTFail("IMKServer / 预热 / app.run 有一处缺失")
+            return
+        }
+        XCTAssertLessThan(server.lowerBound, warmup.lowerBound)
+        // 注释里也写了 app.run()，所以从预热之后开始找真正那一句。
+        guard let run = main.range(of: "app.run()", range: warmup.upperBound..<main.endIndex) else {
+            XCTFail("app.run() 缺失")
+            return
+        }
+        XCTAssertLessThan(warmup.lowerBound, run.lowerBound)
+        XCTAssertTrue(main.contains("import VoiceInterface"))
+        XCTAssertTrue(main.contains("VoiceEngine.bundledModelDirectory()"))
+        XCTAssertTrue(main.contains("VoiceEngine.bundledMetallib()"))
+    }
+
+    /// 首次 handle 不再自己建引擎：复用预热的那个，只在没预热时退回懒建。
+    func testEnsureVoiceGateReusesWarmup() throws {
+        let controller = try source("SquirrelInputController.swift")
+        guard let gate = controller.range(of: "private func ensureVoiceGate()"),
+              let keyEvent = controller.range(of: "private func voiceKeyEvent(")
+        else {
+            XCTFail("ensureVoiceGate 缺失")
+            return
+        }
+        let body = controller[gate.upperBound..<keyEvent.lowerBound]
+        XCTAssertTrue(body.contains("VoiceEngineWarmup.shared"))
+        XCTAssertTrue(body.contains("VoiceEnginePreheatedTransport"))
+        XCTAssertTrue(body.contains("warmup.route"))
+        XCTAssertTrue(body.contains("warmup.status == .idle"))
+        XCTAssertTrue(body.contains("VoiceEngine("))
+        XCTAssertFalse(body.contains("Thread.sleep"))
+        XCTAssertFalse(body.contains(".wait()"))
+    }
+}

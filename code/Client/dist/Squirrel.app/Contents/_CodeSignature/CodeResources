@@ -49,6 +49,10 @@
 		<data>
 		+8sxs9kSkAmTP5e6r5KxrBBMiXI=
 		</data>
+		<key>Resources/voice-assets.sha256</key>
+		<data>
+		Y5gAdS+iecebABJNAeA9impN5o4=
+		</data>
 		<key>Resources/worker.py</key>
 		<data>
 		aN5q0Y2TjtLWOa5gqwhGDGHE92Q=
@@ -216,6 +220,13 @@
 			<key>hash2</key>
 			<data>
 			upkjRoRk3ciHM4VhIeCBiSj3oht5BYDm5Q7Cu6abot8=
+			</data>
+		</dict>
+		<key>Resources/voice-assets.sha256</key>
+		<dict>
+			<key>hash2</key>
+			<data>
+			TDGL3c753RTuleE8RgsXN5VHFf98eUGm9Y7jT3Y+faA=
 			</data>
 		</dict>
 		<key>Resources/worker.py</key>

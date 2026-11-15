@@ -9,7 +9,7 @@ cd code/voice-engine
 cargo test --workspace --offline
 ```
 
-exit 0。`voice-asr` 9、`voice-ffi` 11、`voice-mel` 3、`voice-tokenizer` 4+5、`voice-parity` 2+4（另有 4 条 `#[ignore]`）、`voice-tensor` 的 `shapes` 6 通过：合计 44 通过、4 忽略、0 失败。`voice-mlx` 在未打开 `metal` 时没有测试，也没有下载或编译 `mlx-rs`。
+exit 0。`voice-asr` 9、`voice-ffi` 11、`voice-mel` 3、`voice-tokenizer` 4+5、`voice-parity` 7+4（另有 4 条 `#[ignore]`）、`voice-tensor` 的 `shapes` 6 通过：合计 49 通过、4 忽略、0 失败。`voice-mlx` 在未打开 `metal` 时没有测试，也没有下载或编译 `mlx-rs`。
 
 ## 打开 metal
 
@@ -243,3 +243,290 @@ bash scripts/make-app.sh
 
 第一次按键仍付 4.7–4.9 s：`SquirrelInputController.ensureVoiceGate()` 懒建引擎，那段在
 `code/Client`，本次没动。所有秒数都是 `dev` 档案。
+
+## 容差口径与归因闸（2026-11-14，见 notes/060）
+
+容差只在 `code/voice-engine/voice-parity/src/tolerance.rs` 定义一处：
+`容差 = 参考张量的绝对值上界 × 2^-11 × 允许的单位数`。参考是 f16，`2^-11` 是
+「元素按自身量级折算的半个 f16 间距」的上界；单位数与实测值写在每个常量旁边。
+编码器、解码器与梅尔三条闸都引用它，不再各写绝对容差。
+
+解码器主闸（`decoder_parity::decoder_prefill_matches_reference`）带两条归因断言：
+`RopeMode::SinOnly` 与 `qk_norm: false` 都必须让首 64 维最大差变大，并且大到容差外。
+本次没有改算术：解码器主闸实测差仍是 7.8125e-2（容差 8.203125e-2，余量 1.05 倍），
+编码器三条与端到端四条不变；`cargo test --workspace --offline` 49 通过、4 忽略、0 失败。
+
+## 梅尔前端换 vDSP 实数 FFT（2026-11-14，见 notes/062）
+
+`voice-mel` 不再每帧对 201 个频点各做一次 400 点复 DFT。macOS 上走 Accelerate 的
+`vDSP_DFT_zrop`：400 = 5 × 80，五条 80 点实数 DFT（80 = 5·2⁴ 是 vDSP 支持的长度）
+再按 `X[k] = Σ_r W_400^{rk}·A_r[k mod 80]` 合并。400 本身 vDSP 没有实现
+（`vDSP_DFT_zrop_CreateSetup(400)` 返回空指针），也不补零到 512 / 480——见 notes/062 第 1 节。
+非 macOS 目标退化成逐点直接 DFT，那条路径不追求速度。
+
+`voice-mel` 因此多了一条链接要求：`#[link(name = "Accelerate", kind = "framework")]`。
+`cargo test -p voice-mel` 由 rustc 自己加上这条参数；链 `libvoice_ffi.a` 的临时程序与
+Squirrel 本来就带 `-framework Accelerate`（见上文 otool 那一节与 `link.sh`），不必再加。
+
+```
+cd code/voice-engine
+cargo test --workspace --offline
+```
+
+exit 0。**51 通过**（`voice-mel` 从 3 条变 5 条：新增抽取下标/旋转因子表的核对与
+单频起峰两条）、4 忽略、0 失败。打开 metal 的三套闸 13 通过、0 失败，实测差值与 060 逐位相同；
+梅尔闸实测最大绝对差从 3.2138824e-4 降到 6.866455e-5（容差仍是 1e-3）。
+
+同一探针、同一份归档（`bench2`，同进程 cold/warm/warm，三次）：
+
+```
+engine_new 4.813–5.296 s（含常驻权重，与改前同一档）
+cold finish 0.232 / 0.239 / 0.491 s      # 改前 0.451–0.519
+warm finish 0.194 / 0.192 / 0.190 s      # 改前 0.423–0.434
+```
+
+梅尔本体（`/tmp/voice-abi/melbench`，dev 档案，同一台机器同一时段）：0.272 → 0.050 s。
+
+## 说话中出字：每满 2 秒回一条 `partial`（2026-11-14，见 notes/063）
+
+`voice-mlx` 新增 `src/backend/stream.rs`：`Stream` 带这一次按住的样本、已结束各窗的
+投影输出（`prefix`）、已进前缀的帧数与上一段的整段假设；`Engine::stream_step` 跑一步：
+整段重算梅尔 → 满 800 帧的窗冻结进前缀 → 活动窗重编 → 提示 = 模板 + 已固定的文本，
+只重算未固定的 5 个 token。`prefix` 与已固定的文本跨步复用；解码器的键值只在步内复用
+（音频占位个数每步都变，`<pad>` 之后的 RoPE 位置整体平移，跨步对不上）。
+
+窗边界与一次性编码那条路是同一条算术，但不是逐位相同：1200 帧一次编完与切成
+800 + 400 两段编，投影最大绝对差 1.0691956e-4（f16 归约次序）。8 秒以内两条路是
+同一次调用、同一个张量，逐位相同，所以 2 秒、4 秒、8 秒的定稿与改造前一字不差。
+
+`voice-ffi/src/decoder.rs` 的 `WeightDecoder` 分两条：非定稿步走
+`stream_step_on_resident`，定稿仍走原来那条整段重算。`json_line.rs` 与 `SessionSink`
+一个字没改：`kind:"partial"`、`decoded` 恒为真本来就在。
+
+`voice-ffi/src/engine.rs` 多一位 `finishing`（`Arc<AtomicBool>`）：`voice_session_finish`
+一进来就置真，排在 `Finish` 前面的 `Feed` 出队时跳过那一步的部分识别（定稿会整段重算，
+那一步一定白跑）。不跳过时 4 秒语音的 `finish` 是 1.14 秒，跳过之后 0.62 秒，与改造前
+同一档。
+
+`voice-asr/src/session.rs` 的 `apply` 加一条：非定稿步的空串不下发（空串表示「这一步没有
+新文本」，不是「整段变空」；按原样会发一条 `text:""` 的 `partial`，把预编辑清掉）。
+
+```
+cd code/voice-engine
+cargo test --workspace --offline
+```
+
+exit 0。**53 通过**（`voice-asr` 9 → 10、`voice-ffi` 11 → 12）、4 忽略、0 失败。
+打开 metal：`--lib` 5 条（含 `stream` 两条）、`encoder_parity` 3、`decoder_parity` 6、
+`end_to_end_parity` 4 全过，解码器主闸仍是 7.8125e-2 对容差 8.203125e-2。
+另有 `--ignored` 的 `--test streaming` 两条：逐步墙钟与「定稿等于整段重算」，
+以及切窗编码与整段编码的差（1.0691956e-4，闸是 1e-3）。
+
+```
+cargo build -p voice-ffi --features metal --target aarch64-apple-darwin
+bash /tmp/voice-abi/link.sh /tmp/voice-abi/bench5.c /tmp/voice-abi/bench5
+/tmp/voice-abi/bench5 <model_dir> <metallib> /tmp/voice-abi/speech4.bin 16000 1
+```
+
+4 秒语音按 1 秒一块实时送（`bench5`，新归档）：`partial` 2.394 / 2.408 / 2.412 秒
+「今天天气不错，我们。」，`final` 4.642 / 4.658 / 4.663 秒，`finish` 0.622 / 0.638 / 0.649 秒。
+改造前同一 `bench5.c` 链旧归档：只有 `final` 4.621–4.628 秒，`finish` 0.608–0.610 秒。
+10 秒语音：四条 `partial` 2.384 / 4.606 / 6.789 / 8.790 秒，文本逐步变长；定稿与改造前逐字相同。
+2 秒探针：token 仍是 `[106287, 1773, 151645]`、文本「嗯。」，`finish` 0.229–0.244 秒。
+
+`code/VoiceInterface` 27 条、`code/Client` 9 条测试通过，`swift build --product Squirrel`
+exit 0（40597808 字节）。安装包没有重装，仍是 14:57 的产物。
+
+## 装载路径：按文件位宽建数组、末尾一次 eval（2026-11-15，见 notes/065）
+
+`voice-mlx/src/backend/weights.rs` 不再把 f16 字节逐元素解码成 `Vec<f32>` 再交给 MLX：
+裸字节读进一段 8 字节对齐的缓冲（`Vec<u64>` 撑起点），`Array::from_raw_data` 按文件里的
+位宽直接建数组（`F16` → `Float16`、`U32` → `Uint32`），只有文件位宽与目标位宽真不一样时
+才挂 `as_dtype`。`SafeWeights` 多一个 `pending: Vec<Array>`，两座塔一路只建图，末尾
+`finish()` 用 `mlx_rs::transforms::eval` 一次求完（以前每张量一次）。
+
+`Engine::open` 改为两塔共用一份 `SafeWeights`：文件只开一次，`eval` 只有一次。
+`AudioTower::open`、`TextDecoder::open_with`、`TextDecoder::open` 保持原签名，内部各自
+`finish()`；`TextDecoder::load` / `AudioTower::load` 是给共用一份权重的那两条口子。
+
+四段计时在 `weights.rs` 的单元测试 `load_phases_are_reported_one_by_one`（`#[ignore]`，
+只在 `cfg(test)` 下存在，产品归档里没有 `Instant`）：
+
+```
+export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+export LIBRARY_PATH="$SDKROOT/usr/lib"
+export MLX_SYS_SYSTEM_SDK=1
+export RUSTFLAGS="-C link-arg=-framework -C link-arg=Accelerate -C link-arg=-Wl,-U,_MTLTensorDomain ..."
+cargo test -p voice-mlx --features metal --target aarch64-apple-darwin --offline \
+  --lib load_phases -- --ignored --nocapture --test-threads=1
+```
+
+改前 / 改后（同一台机器、同一探针、同一模型目录，各六次中位）：
+
+```
+engine_new        4.841 s                 → 0.742 s
+表头              0.0005 s                → 0.0013 s
+字节读取          0.391 s（1227 次、537 MB）→ 0.313 s
+主机侧转换        3.731 s                 → 0.067 s
+eval 与上传       0.491 s（722 次）        → 0.117 s（1 次）
+两塔装载（含末尾 eval）4.785 s            → 0.654 s（0.537 装载 + 0.117 一次 eval）
+cold finish       0.403–0.464 s           → 0.222–0.263 s
+warm finish       0.199–0.206 s           → 0.187–0.193 s
+最大 RSS          629637120 字节           → 723402752 字节
+```
+
+token 仍是 `[106287, 1773, 151645]`、文本仍是「嗯。」；解码器主闸仍是 7.8125e-2 对容差
+8.203125e-2。`cargo test --workspace --offline` 53 通过、4 忽略、0 失败；打开 metal 的
+`--lib` 4 通过 + 1 忽略（忽略的就是本次新增的分段计时那条）、`encoder_parity` 3、
+`decoder_parity` 6、`end_to_end_parity` 4、`--ignored` 的 `streaming` 2 全过。
+
+## 装载分两段：文本塔留到 begin 之后再装（2026-11-15，见 notes/066）
+
+`voice_mlx::Engine` 拆成两段打开，`voice_ffi` 在 `voice_session_begin` 之后的那一步装第二段：
+
+- `Engine::open_audio(model_dir, dtype)`：梅尔前端 + `weights.safetensors` 表头 + `audio_tower.*`
+  523 张张量（202 MB），收尾一次 `eval`。`voice_engine_new` 走这一条。
+- `Engine::load_text()`：分词器（`vocab.json` + `merges.txt`）+ `model.*` 704 张张量（335 MB）
+  + `model.norm` + 词嵌入表，再一次 `eval`；装完把权重文件与模型目录放开。幂等，装过回
+  `Ok(false)`。文本塔不在位时 `Engine::transcribe` 返回 `文本塔还没装好`，不给空串。
+- `Engine::open` 仍是两段连做，签名不变；`AudioTower::open` / `TextDecoder::open(_with)` 一字未改。
+- `voice-ffi`：`decoder::boot_resident` 换 `open_audio`；新增 `load_text_resident` / `text_ready`；
+  `engine.rs` 的 `Begin` 分支在 `reply.send(0)` **之后**调 `backend::load_text_deferred()`，
+  `Finish` 分支在 `slot.finish()` 之前再调一次（失败写 `文本塔装载失败：<原因>`）。
+  `begin` 不等第二段，`finish` 一定在第二段之后；说话中的部分步在文本塔未就位时回空。
+
+同一探针、同一模型目录、同一份 metallib，`bench6.c`（`/tmp/voice-abi`，四种口径）与
+`keyprobe`（真实预热 + 真实门）：
+
+```
+                              改前                改后
+voice_engine_new              0.740–0.813 s       0.128–0.150 s（页缓存冷 0.198 / 0.389）
+第一段（梅尔+音频塔）          —                   0.152 s
+第二段（分词器+文本塔）        —                   0.643 s（分词器 0.429 + 文本塔 0.214）
+进程起→可以接受按键（keyprobe）0.749–0.770 s       0.128–0.140 s
+按下→出字（2 秒说话实时送）   2.266–2.289 s       2.268–2.376 s
+进程起→出字（同上）           3.006–3.118 s       2.401–2.513 s
+按下→出字（0.3 秒）           0.488–0.492 s       0.792–0.812 s
+进程起→出字（0.3 秒）         1.233–1.273 s       0.926–0.950 s
+按下→出字（2 秒一次喂完即松手）0.233–0.255 s       0.831–0.848 s
+最大 RSS                      709574656–713785344  710033408–714391552 字节（差在噪声内）
+```
+
+token 仍是 `[106287, 1773, 151645]`、文本仍是「嗯。」；`cargo test --workspace --offline`
+54 通过、4 忽略、0 失败（`voice-ffi` 新增一条时序测试）；打开 metal 的 `--lib` 4 通过 + 1 忽略、
+`--test staged_load` 1、`encoder_parity` 3、`decoder_parity` 6、`end_to_end_parity` 4、
+`--ignored` 的 `streaming` 2 全过，差值与 065 逐位相同。
+
+极短那一档按下→出字变慢 0.30–0.60 秒（第二段现在落在会话里等），同一档的「进程起→出字」
+仍更早；两条都写在 066 第 5 节。
+
+## 装载这一刀的验收（2026-11-15，见 notes/067）
+
+只复测与重打包，源码一字未改：归档 285 348 856 字节（15 Nov 06:54，
+`md5 5160b33e5d39c79a1447c1659fe14159`），`cargo build -p voice-ffi --features metal
+--target aarch64-apple-darwin` 复查 `Finished` 0.04 秒、无改动。
+
+```
+cargo test --workspace --offline                      # 54 通过、4 忽略、0 失败
+cargo test -p voice-mlx --features metal --target aarch64-apple-darwin --offline \
+  --lib -- --test-threads=1                           # 4 通过 + 1 忽略
+  --test encoder_parity / decoder_parity / end_to_end_parity -- --test-threads=1
+                                                       # 3 / 6 / 4 全过，差值与 065 逐位相同
+  --test staged_load                                   # 1 通过（0.104 + 0.603 秒）
+  --test streaming -- --ignored                        # 2 通过
+  --lib load_phases -- --ignored                       # 表头 0.0004 / 读 0.378 / 转 0.077 /
+                                                       # 一次 eval 0.140 / 四项之外 0.162
+```
+
+`/tmp/voice-abi/bench7`（15 Nov 06:58，链上面那份归档）九次 `engine_new` 中位 **0.137 秒**
+（0.133–0.286，两次偏高都是冷启动），暖定稿六次中位 **0.200 秒**、装包资产三次中位
+**0.193 秒**；冷定稿 0.847–1.098 秒（含第二段）。文本仍是「嗯。」。
+
+重打包：`rm -f .build/out/Products/Debug/Squirrel && swift build --product Squirrel` 之后
+`Debug/Squirrel` 40 605 120 字节、`nm -gU` 里 `backend10transcribe` 57 次；
+`bash scripts/make-app.sh` 与 `bash ../scripts/install-app.sh` 走完，
+`codesign --verify --deep --strict` exit 0，包内 Info.plist 2791、mlx.metallib 183 870 464、
+weights.safetensors 537 626 967、vocab.json 2 776 833 字节，「资产哈希与包内清单一致」。
+
+## 梅尔只算新样本：增量接口（2026-11-15，见 notes/068）
+
+`voice-mel` 新增 `MelStream`（`push` / `push_i16` / `shaped_columns` / `shaped_block` /
+`raw_block`），`voice-mlx` 的 `backend/stream.rs` 改成每步只对新样本求梅尔，
+`Stream` 里不再留整段 `pcm`。`MelFrontend::log_mel*`（定稿那条路）一个算子没动。
+
+整形前的原始帧缓存在 `MelStream` 里：一帧只取决于它自己那 400 个样本，
+已定帧的窗不会再变。参考实现在整形前要减「全局最大值减 8」，
+这个 max 增量维护（已定帧单调不减 + 末尾那一帧每次按新右端反射重算），
+取值时按当前前缀套用。12 秒处增量与整段重算的最大绝对差 **0**
+（`incremental_matches_whole_utterance_bitwise` 在 201..8000 每个长度上逐位断言）。
+
+```
+cargo test --workspace --offline                       # 61 通过、4 忽略、0 失败（voice-mel 5 → 12）
+cargo test -p voice-mlx --features metal --target aarch64-apple-darwin --offline \
+  --test streaming -- --ignored --test-threads=1        # 2 通过；六步梅尔 0.034–0.035 s 不随长度长
+  --test encoder_parity / decoder_parity / end_to_end_parity
+                                                        # 3 / 6 / 4 全过，差值与 067 逐位相同
+```
+
+`/tmp/voice-abi/melstream`（同一探针，六步各 2 秒，`opt-level = 0`）：
+
+```
+步 | 音频   | 帧数 | 老路整段梅尔 | 增量新样本 | 增量整形 | 增量合计
+1  |  2.00s |  200 | 0.0338 s     | 0.0337 s   | 0.0005 s | 0.0342 s
+6  | 12.00s | 1200 | 0.2038 s     | 0.0347 s   | 0.0009 s | 0.0357 s
+```
+
+归档重编：`cargo build -p voice-ffi --features metal --target aarch64-apple-darwin`
+（285 489 624 字节）；`bench2` 暖定稿 0.168–0.213 秒、`engine_new` 0.125–0.269 秒，
+token `[106287, 1773, 151645]`、文本「嗯。」。
+
+## 提示头与已结束窗的行只预填充一次（2026-11-15，见 notes/069）
+
+说话中那条路（`voice-mlx/src/backend/stream.rs`）每步要预填充的不再是整条提示：
+`Stream` 留一份 28 层的键值缓存，缓存开头「提示头 + 已结束各窗的行」只在第一次算一遍。
+位置 `0..head_tokens + prefix.len()/HIDDEN` 的内容每步一样，后面每步截掉重算——
+音频占位个数每步变、位置整体平移，所以能照用的只有仍然**是前缀**的那一段。
+
+截断与续写都按绝对位置对齐，拼一次 `concatenate` 就够（`kv_write` 本来就做这件事），
+后端没有新增「两段键值」的形状。新冻窗那一步（活动窗刚凑满 800 帧）要整窗重算一次：
+那 104 行在缓存里还是按活动窗编出来的旧内容。
+
+```text
+TextDecoder::prefill_chunk(ops, cache, tokens, audio, position, head_dims, options)
+TextDecoder::greedy_from_cache(ops, cache, base, next, max_new_tokens, options)
+transcribe::{PromptParts, prompt_parts, splice_prompt}   // head / pads / tail 三段按 id 拼
+```
+
+14 秒探针（每步 2 秒，六步，三次中位；「改前」是同一份归档把复用关掉）：
+
+```text
+步 | 音频   | 提示位置 | 重算（前 → 后） | 预填充（前 → 后）  | 步墙钟（前 → 后）
+1  |  2.00s |      44 |    44 → 44     | 0.042 → 0.041 秒  | 0.186 → 0.181 秒
+2  |  4.00s |      70 |    70 → 61     | 0.049 → 0.043 秒  | 0.388 → 0.368 秒
+3  |  6.00s |      96 |    96 → 87     | 0.049 → 0.048 秒  | 0.593 → 0.572 秒
+4  |  8.00s |     122 |   122 → 113    | 0.059 → 0.056 秒  | 0.819 → 0.785 秒
+5  | 10.00s |     148 |   148 → 35     | 0.069 → 0.043 秒  | 1.037 → 0.966 秒
+6  | 12.00s |     174 |   174 → 61     | 0.073 → 0.043 秒  | 1.263 → 1.158 秒
+合计       |        |                | 0.341 → 0.274 秒  | 1.263 → 1.158 秒（少 8.3%）
+```
+
+30 秒探针（十四步）：提示从 44 涨到 382 个位置，重算的位置在 35 / 61 / 87 / 113
+四个值上循环，预填充 0.043–0.064 秒；同长度整段一次预填充 0.120 秒。
+
+复用与整段预填充的差（12 秒的提示，留 113 个位置、重算 61 个）：argmax 相同，
+前 64 维 logits 最大绝对差 7.8125e-2（上界 2.0328125e1，按 `PREFILL_LOGITS_UNITS = 8`
+算是 7.87 个单位、余量 1.02 倍）。token 与文本六步全对：
+`[106287, 1773, 151645]`、「嗯。」。
+
+```
+cargo test --workspace --offline                        # 61 通过、4 忽略、0 失败
+cargo test -p voice-mlx --features metal --target aarch64-apple-darwin --offline \
+  --test streaming -- --ignored --nocapture --test-threads=1
+                                                        # 6 条实测全过（新增 4 条）
+  --test encoder_parity / decoder_parity / end_to_end_parity
+                                                        # 3 / 6 / 4 全过，差值与 068 逐位相同
+```
+
+归档重编后 `bench2` 暖定稿 0.170–0.179 秒、token `[106287, 1773, 151645]`、文本「嗯。」
+（定稿那条路一个算子没动）；`bench6` 的 press 模式下 `VOICE_STREAM_LOG` 多打一项
+「预填充 0.047s（重算 44 个位置，沿用 0 个）」。

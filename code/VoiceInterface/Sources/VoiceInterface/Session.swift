@@ -15,6 +15,8 @@ public struct VoiceSession: Equatable, Sendable {
     public var lastShown: String?
     public var recognition: RecognitionRecord?
     public var rewrite: RewriteRecord?
+    /// 被外部取消时记下来由；正常定稿关掉的会话保持 nil。
+    public var abandonReason: VoiceAbandonReason?
 
     public static func opened(id: UInt64, bundleIdentifier: String?) -> VoiceSession {
         VoiceSession(
@@ -25,7 +27,8 @@ public struct VoiceSession: Equatable, Sendable {
             deliveryAllowed: true,
             lastShown: nil,
             recognition: nil,
-            rewrite: nil
+            rewrite: nil,
+            abandonReason: nil
         )
     }
 }
@@ -109,6 +112,21 @@ public struct VoiceMachine {
             session = done
         }
         return effects
+    }
+
+    /// 从外部取消：不看文本框、不产生任何效果，直接把会话关掉。
+    /// 识别与改写记录一并清掉，迟到的回包找不到可提交的东西。
+    /// 会话已经关掉或从来没开过时幂等返回空列表。
+    public mutating func abandon(reason: VoiceAbandonReason) -> [VoiceEffect] {
+        guard var current = session, current.life == .open else { return [] }
+        current.life = .closed
+        current.closeRequested = true
+        current.recognition = nil
+        current.rewrite = nil
+        current.lastShown = nil
+        current.abandonReason = reason
+        session = current
+        return []
     }
 
     /// 引擎拒绝了这一次。会话就此关闭，下一次按下才能开新会话；

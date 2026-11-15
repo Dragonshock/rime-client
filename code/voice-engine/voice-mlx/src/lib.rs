@@ -11,9 +11,10 @@ mod backend;
 
 #[cfg(feature = "metal")]
 pub use backend::{
-    build_prompt, encode_mel, encode_mel_with, prompt_tokens, transcribe, transcribe_with,
-    transcribe_with_opened, AudioTower, DecoderOptions, EncoderOptions, EncoderOutput, Engine,
-    Generation, MlxBackend, MlxError, MlxTensor, Opened, PositionDenominator, PrefillLogits,
-    QuantPolicy, RopeMode, StopReason, TextDecoder, Transcription, EOS, IM_END, LM_HEAD_BLOCK,
+    build_prompt, encode_mel, encode_mel_with, prompt_parts, prompt_tokens, splice_prompt,
+    transcribe, transcribe_with, transcribe_with_opened, AudioTower, DecoderOptions,
+    EncoderOptions, EncoderOutput, Engine, Generation, MlxBackend, MlxError, MlxTensor, Opened,
+    PositionDenominator, PrefillLogits, PromptParts, QuantPolicy, RopeMode, StopReason, Stream,
+    StreamOpened, StreamStep, TextDecoder, Transcription, EOS, IM_END, LM_HEAD_BLOCK,
     MAX_NEW_TOKENS, PROMPT_LANGUAGE,
 };

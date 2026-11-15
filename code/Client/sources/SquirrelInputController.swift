@@ -231,6 +231,9 @@ final class SquirrelInputController: IMKInputController, VoiceFieldHost {
   }
 
   override func deactivateServer(_ sender: Any!) {
+    // 先关语音会话：失焦之后松手事件不会再来了，不先把采集停掉它就一直录。
+    // 这一行只动语音门：不碰 preedit，也不影响下面那次键盘组合提交。
+    voiceGate?.abandon(reason: .deactivate)
     hidePalettes()
     commitComposition(sender)
     client = nil
@@ -242,6 +245,9 @@ final class SquirrelInputController: IMKInputController, VoiceFieldHost {
   }
 
   override func commitComposition(_ sender: Any!) {
+    // 系统也可能直接调到这里（回车、换输入法、窗口关闭）。取消是幂等的：
+    // 已经由 deactivateServer 关掉的那一枚到这里返回 false，不会再停一次采集。
+    voiceGate?.abandon(reason: .deactivate)
     self.client ?= sender as? IMKTextInput
     if session != 0 {
       if let input = rimeAPI.get_input(session) {
@@ -591,20 +597,38 @@ extension SquirrelInputController {
     commit(string: text)
   }
 
+  /// 预热过的引擎直接用。预热还没跑完时按键最多等 `keyPressBudget`，到点就拒，
+  /// 不在这里再建一个（权重会变成两份），也不无声挂住主线程。
   private func ensureVoiceGate() -> VoiceHandleGate {
     if let voiceGate = voiceGate {
       return voiceGate
     }
     let bridge = ReplyBridge()
-    let transport = VoiceEngine(
-      modelDirectory: VoiceEngine.bundledModelDirectory(),
-      metallibPath: VoiceEngine.bundledMetallib(),
-      onReply: { reply in
+    let warmup = VoiceEngineWarmup.shared
+    let transport: RecognitionTransport
+    if warmup.status == .idle {
+      // 没走过启动预热（非 App 启动路径）：保持原来的懒建。
+      let engine = VoiceEngine(
+        modelDirectory: VoiceEngine.bundledModelDirectory(),
+        metallibPath: VoiceEngine.bundledMetallib(),
+        onReply: { reply in
+          bridge.onReply?(reply)
+        }
+      )
+      if let reason = engine.unavailableReason {
+        VoiceLog.write(reason)
+      }
+      transport = engine
+    } else {
+      warmup.route { reply in
         bridge.onReply?(reply)
       }
-    )
-    if let reason = transport.unavailableReason {
-      VoiceLog.write(reason)
+      if let reason = warmup.status.failureReason {
+        VoiceLog.write(reason)
+      }
+      transport = VoiceEnginePreheatedTransport(warmup: warmup) { reply in
+        bridge.onReply?(reply)
+      }
     }
     let gate = VoiceHandleGate(
       configuredKey: voiceConfiguredKey,

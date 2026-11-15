@@ -1,13 +1,93 @@
 #!/bin/bash
+# 打本机包。模型与 metallib 显式给出，不再用 find 到构建目录里猜。
+#
+# 用法（都可省，省了用下面的默认值）
+#   code/Client/scripts/make-app.sh
+#   VOICE_MODEL_DIR=/tmp/voice/qwen3-asr-0.6b-4bit VOICE_METALLIB=/tmp/voice/mlx.metallib \
+#     code/Client/scripts/make-app.sh
+#   code/Client/scripts/make-app.sh --model-dir DIR --metallib FILE --app /tmp/X.app
+#
+# 默认值
+#   VOICE_MODEL_DIR = $ROOT/code/assets/qwen3-asr-0.6b-4bit
+#   VOICE_METALLIB  = $ROOT/code/assets/mlx.metallib
+#   OUT_APP         = $ROOT/code/Client/dist/Squirrel.app
+# 这两份资产由 code/scripts/fetch-model.sh 取到 code/assets，不进 git。
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 CLIENT="$ROOT/code/Client"
 BIN="$CLIENT/.build/out/Products/Debug/Squirrel"
-APP="$CLIENT/dist/Squirrel.app"
+APP="${OUT_APP:-$CLIENT/dist/Squirrel.app}"
 HEADERS_OK="$CLIENT/Headers/rime/key_table.h"
+ASSETS="${VOICE_ASSETS:-$ROOT/code/assets}"
+MODEL_DIR="${VOICE_MODEL_DIR:-$ASSETS/qwen3-asr-0.6b-4bit}"
+METALLIB="${VOICE_METALLIB:-$ASSETS/mlx.metallib}"
 
-test -x "$BIN"
-test -f "$HEADERS_OK"
+fail() {
+  printf 'make-app.sh: %s\n' "$*" >&2
+  exit 1
+}
+
+usage() {
+  sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
+  exit 0
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --model-dir)
+      [ $# -ge 2 ] || fail "--model-dir 后面要给目录"
+      MODEL_DIR="$2"
+      shift 2
+      ;;
+    --metallib)
+      [ $# -ge 2 ] || fail "--metallib 后面要给文件路径"
+      METALLIB="$2"
+      shift 2
+      ;;
+    --app)
+      [ $# -ge 2 ] || fail "--app 后面要给包路径"
+      APP="$2"
+      shift 2
+      ;;
+    -h | --help)
+      usage
+      ;;
+    *)
+      fail "不认识的参数：$1（--help 看用法）"
+      ;;
+  esac
+done
+
+[ -x "$BIN" ] || fail "没有可执行文件：$BIN
+先编：cd code/Client && swift build --product Squirrel"
+[ -f "$HEADERS_OK" ] || fail "缺头文件：$HEADERS_OK（code/Client/Headers 不完整）"
+
+# 资产先全部核对，再动 dist：这样缺文件时不会留下半个包。
+[ -e "$METALLIB" ] || fail "没有 mlx.metallib：$METALLIB
+取资产：code/scripts/fetch-model.sh --metallib-from-build
+或者用 --metallib FILE（等价环境变量 VOICE_METALLIB）显式给出"
+[ -f "$METALLIB" ] || fail "mlx.metallib 不是普通文件：$METALLIB"
+[ -L "$METALLIB" ] && fail "mlx.metallib 是符号链接：$METALLIB；给真实文件（不要拷 HF 快照里的链接）"
+[ -s "$METALLIB" ] || fail "mlx.metallib 是空文件：$METALLIB"
+
+[ -d "$MODEL_DIR" ] || fail "没有模型目录：$MODEL_DIR
+取资产：code/scripts/fetch-model.sh --dest "$ASSETS"
+或者用 --model-dir DIR（等价环境变量 VOICE_MODEL_DIR）显式给出"
+for f in config.json merges.txt quantization_config.json tokenizer_config.json vocab.json weights.safetensors; do
+  [ -f "$MODEL_DIR/$f" ] || fail "模型目录缺文件：$MODEL_DIR/$f
+完整清单见 code/scripts/fetch-model.sh 的注释；重取：code/scripts/fetch-model.sh --dest \"$ASSETS\""
+  [ -L "$MODEL_DIR/$f" ] && fail "$MODEL_DIR/$f 是符号链接；包里的权重必须是真实文件"
+  [ -s "$MODEL_DIR/$f" ] || fail "$MODEL_DIR/$f 是空文件"
+done
+if find "$MODEL_DIR" -type l | grep -q .; then
+  fail "模型目录里还有符号链接：$(find "$MODEL_DIR" -type l | head -3 | tr '\n' ' ')"
+fi
+
+# 有清单就逐个核对，防止把改过的权重打进包。
+if [ -f "$ASSETS/MANIFEST.sha256" ]; then
+  ( cd "$ASSETS" && shasum -a 256 -c MANIFEST.sha256 --quiet ) ||
+    fail "$ASSETS 里的文件与 MANIFEST.sha256 不一致；重取：code/scripts/fetch-model.sh --dest \"$ASSETS\" --force"
+fi
 
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Frameworks" "$APP/Contents/Resources"
@@ -16,40 +96,22 @@ cp "$BIN" "$APP/Contents/MacOS/Squirrel"
 cp "$ROOT/dev-docs/refs/code/squirrel/resources/rime.pdf" "$APP/Contents/Resources/rime.pdf"
 cp "$ROOT/code/voice-worker/worker.py" "$APP/Contents/Resources/worker.py"
 
-# mlx.metallib 来自 mlx-sys 的构建输出。权重来自本机 Hugging Face 快照，必须解开符号链接。
-# 构建目录里可能有多份 mlx-sys 产物，只取最新的一份。
-METALLIB="$(find "$ROOT/code/voice-engine/target" -path '*/mlx-sys-*/out/build/lib/mlx.metallib' -type f -print0 | xargs -0 ls -t 2>/dev/null | head -1)"
-test -n "$METALLIB"
-test -f "$METALLIB"
-test ! -L "$METALLIB"
-cp -L "$METALLIB" "$APP/Contents/Resources/mlx.metallib"
-test -f "$APP/Contents/Resources/mlx.metallib"
-test ! -L "$APP/Contents/Resources/mlx.metallib"
+cp "$METALLIB" "$APP/Contents/Resources/mlx.metallib"
+[ -f "$APP/Contents/Resources/mlx.metallib" ] || fail "metallib 没进包"
+[ -L "$APP/Contents/Resources/mlx.metallib" ] && fail "包里的 metallib 是符号链接"
 
-HF_ROOT="$HOME/.cache/huggingface/hub/models--moona3k--mlx-qwen3-asr-0.6b-4bit"
-REV="$(tr -d '[:space:]' < "$HF_ROOT/refs/main")"
-SNAP="$HF_ROOT/snapshots/$REV"
-test -f "$SNAP/weights.safetensors"
-test -f "$SNAP/config.json"
-test -f "$SNAP/tokenizer_config.json"
-test -f "$SNAP/vocab.json"
-test -f "$SNAP/merges.txt"
 MODEL="$APP/Contents/Resources/Models/Qwen3-ASR-0.6B-4bit"
 mkdir -p "$MODEL"
-cp -RL "$SNAP/." "$MODEL/"
-test -f "$MODEL/weights.safetensors"
-test -f "$MODEL/config.json"
-test -f "$MODEL/tokenizer_config.json"
-test -f "$MODEL/vocab.json"
-test -f "$MODEL/merges.txt"
-test ! -L "$MODEL/weights.safetensors"
-test ! -L "$MODEL/config.json"
-test ! -L "$MODEL/tokenizer_config.json"
-test ! -L "$MODEL/vocab.json"
-test ! -L "$MODEL/merges.txt"
+cp -R "$MODEL_DIR/." "$MODEL/"
+for f in config.json merges.txt quantization_config.json tokenizer_config.json vocab.json weights.safetensors; do
+  [ -f "$MODEL/$f" ] || fail "包里缺 $MODEL/$f"
+  [ -L "$MODEL/$f" ] && fail "包里的 $MODEL/$f 是符号链接"
+done
 if find "$MODEL" -type l | grep -q .; then
-  echo "model directory still contains a symlink" >&2
-  exit 1
+  fail "包里的模型目录还有符号链接"
+fi
+if [ -f "$ASSETS/MANIFEST.sha256" ]; then
+  cp "$ASSETS/MANIFEST.sha256" "$APP/Contents/Resources/voice-assets.sha256"
 fi
 
 mkdir -p "$APP/Contents/Resources/zh-Hans.lproj" "$APP/Contents/Resources/en.lproj"

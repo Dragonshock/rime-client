@@ -1,0 +1,4 @@
+assets/
+
+# 参考对照资产要进版本库：voice-oracle 下的 .bin 与 manifest 是判定依据
+!voice-oracle/assets/
