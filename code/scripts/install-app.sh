@@ -11,6 +11,7 @@
 #   code/scripts/install-app.sh --assets DIR         # 装之前把 DIR 里的权重与 metallib 补进包（封装包用这个）
 #   code/scripts/install-app.sh --rime-config DIR    # 把 DIR/Rime 的配置播种到 ~/Library/Rime（仅当它为空）
 #   code/scripts/install-app.sh --rime-config DIR --force-rime  # 覆盖已有配置（先备份）
+#   code/scripts/install-app.sh --rebuild-rime       # 删掉 ~/Library/Rime/build 再部署（换过词库或 librime 版本后必做）
 #
 # 环境变量：INSTALL_DEST（默认 "$HOME/Library/Input Methods"）、SOURCE_APP。
 set -euo pipefail
@@ -31,6 +32,7 @@ STOP=1
 ASSETS=""
 RIME_CONFIG=""
 FORCE_RIME=0
+REBUILD_RIME=0
 
 fail() {
   printf 'install-app.sh: %s\n' "$*" >&2
@@ -69,6 +71,10 @@ while [ $# -gt 0 ]; do
       ;;
     --force-rime)
       FORCE_RIME=1
+      shift
+      ;;
+    --rebuild-rime)
+      REBUILD_RIME=1
       shift
       ;;
     -h | --help)
@@ -152,6 +158,16 @@ if [ -f "$DEST/Contents/Resources/voice-assets.sha256" ]; then
 fi
 
 say ""
+if [ "$REBUILD_RIME" -eq 1 ]; then
+  USER_RIME="${RIME_USER_DIR:-$HOME/Library/Rime}"
+  if [ -d "$USER_RIME/build" ]; then
+    say "删掉编译缓存：$USER_RIME/build（只是产物，部署会重建）"
+    rm -rf "$USER_RIME/build"
+  fi
+  say "重新部署（首次编译词库可能要几分钟，那个几百 MB 的语言模型最慢）"
+  RIME_USER_DIR="$USER_RIME" "$DEST/Contents/MacOS/Squirrel" --build | tail -1
+fi
+
 if [ -n "$RIME_CONFIG" ]; then
   [ -d "$RIME_CONFIG/Rime" ] || fail "$RIME_CONFIG/Rime 不存在（先跑 export-rime-config.sh）"
   USER_RIME="$HOME/Library/Rime"

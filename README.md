@@ -88,3 +88,13 @@ scripts/install-app.sh --assets "$PWD/assets" --rime-config "$PWD/rime"
 
 - 真·全新用户目录的一次完整安装（本机 `~/Library/Rime` 已有配置，用 `RIME_USER_DIR` 覆盖口验证过播种与部署能生成 63 MB 的 `build/`，但没在真正的空家目录上走过一遍）。
 - 另一台机器上 Gatekeeper 是否放行。包是本机签名（adhoc，无 Team ID），被拦时执行一次 `xattr -dr com.apple.quarantine ~/Library/Input\ Methods/RimeClient.app`。
+
+### 换过 nix 词库或换过 librime 之后
+
+`~/Library/Rime/build/` 是编译产物，和 `default.yaml`、词库、librime 版本绑在一起。nix 更新词库、或鼠须管（1.16.0）与本客户端（1.17.0）共用同一份缓存时，旧的 `.table.bin` / `.prism.bin` 会和新源对不上，表现为候选排序变怪或 schema 载入失败。
+
+```sh
+code/scripts/install-app.sh --rebuild-rime
+```
+
+它会删掉 `build/` 再部署一次（那个几百 MB 的语言模型最慢，几分钟是正常的）。`build/` 只是产物，删掉不会动方案与词库。
